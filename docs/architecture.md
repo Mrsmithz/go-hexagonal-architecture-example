@@ -13,10 +13,12 @@ flowchart LR
     App --> Echo
     App --> Worker[Optional Kafka worker]
     Worker --> Franz[franz-go adapter]
+    Worker --> Metrics[Processing metrics decorator]
+    Metrics --> Message[Message service]
     Franz --> Broker[Kafka]
 ```
 
-The core imports only the standard library. The HTTP adapter owns its inbound interface, and the core owns the outbound storage interface. Both adapters depend on the core. `internal/app` owns Fx imports. `internal/server` owns HTTP timeouts, listener acquisition, graceful shutdown, and Zap server events. The same Zap logger receives application, HTTP, and Fx events.
+The core imports only the standard library. The HTTP adapter owns its inbound interface, and the core owns the outbound storage interface. Both adapters depend on the core. `internal/app` owns Fx imports. `internal/server` owns HTTP timeouts, listener acquisition, graceful shutdown, and Zap server events. The same Zap logger receives application, HTTP, and Fx events. `internal/message.Service` owns the Kafka message-handling entry point. Fx provides this service, and the consumer calls its `Handle` method through the processing-metrics decorator. The service currently logs message metadata without defining a payload schema or changing storage; the consumer still owns batching, concurrency, and commits.
 
 The service uses `string` for message values instead of a separate message alias. Validation trims Unicode whitespace, rejects invalid UTF-8 and empty values, and limits messages to 1,000 Unicode code points. The HTTP boundary accepts one JSON object with a string `message`, limits its full body to 16 KiB, and rejects unknown fields and extra JSON values.
 

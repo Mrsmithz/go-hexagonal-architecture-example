@@ -15,6 +15,7 @@ import (
 	"example.com/go-backend-example/internal/adapter/sqlite"
 	"example.com/go-backend-example/internal/consumer"
 	"example.com/go-backend-example/internal/greeting"
+	"example.com/go-backend-example/internal/message"
 	"example.com/go-backend-example/internal/server"
 	"github.com/labstack/echo/v5"
 	"go.uber.org/fx"
@@ -60,6 +61,7 @@ func New(config Config, logger *zap.Logger, extra ...fx.Option) *fx.App {
 		fx.Provide(func(config Config) *sqlite.Store { return sqlite.New(config.SQLiteDSN) }),
 		fx.Provide(func(store *sqlite.Store) greeting.Store { return store }),
 		fx.Provide(greeting.NewService),
+		fx.Provide(message.NewService),
 		fx.Provide(func(config Config) *metrics.Consumer { return metrics.New(config.Consumer.Topics) }),
 		fx.Provide(newKafkaRun),
 		fx.Provide(func(service *greeting.Service) httpapi.Service { return service }),

@@ -85,6 +85,12 @@ For Amazon MSK IAM, set `auth: aws-iam` and keep TLS enabled. The worker uses th
 
 Unknown YAML keys and malformed values fail even when Kafka is disabled. Operational validation of bounds, topics, brokers, auth modes, and credentials applies only when Kafka is enabled. `CONFIG_FILE`, `KAFKA_USERNAME`, and `KAFKA_PASSWORD` are the supported environment overrides.
 
+## Message service
+
+`internal/message/service.go` owns application-level message handling through `Service.Handle(context.Context, consumer.Message) error`. Fx injects the service into the Kafka runner, and the metrics decorator surrounds `service.Handle`. `internal/app/kafka.go` only composes the consumer, service, and metrics.
+
+The service currently preserves the metadata-only log behavior. It does not assume a payload schema or mutate greetings. Application-specific business rules belong in `Service.Handle`; returned errors follow the existing processing and commit policy below.
+
 ## Delivery and handler requirements
 
 Offset commits are manual. Automatic commits remain disabled. The worker processes each bounded poll batch concurrently without preserving record order. It attempts every record even if another handler returns an ordinary error. Only after every handling attempt finishes does it synchronously commit the whole batch, whether handlers succeeded or failed. After a successful commit, handler errors are returned through the existing runner/Fx failure path and stop the server. Failed messages whose offsets were committed will not replay after restart. There is no automatic retry or dead-letter queue for these failures.
