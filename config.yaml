@@ -3,6 +3,13 @@ kafka:
   brokers:
     - 127.0.0.1:29092
   group_id: go-backend-consumer
+  auto.offset.reset: earliest
+  fetch.min.bytes: 1
+  fetch.max.bytes: 52428800
+  max.poll.records: 50
+  max.poll.interval.ms: 300000
+  session.timeout.ms: 45000
+  compression.type: lz4
   auth: none
   allow_insecure: true
   tls:
@@ -12,7 +19,6 @@ kafka:
 topics:
   - name: greetings
     consumers: 1
-batch_size: 50
 processing_concurrency: 10
 batch_timeout: 30s
 commit_timeout: 10s

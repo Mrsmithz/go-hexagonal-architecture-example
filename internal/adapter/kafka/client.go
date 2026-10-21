@@ -45,14 +45,36 @@ func newClient(cfg consumer.Config, topic consumer.TopicConfig, mechanism sasl.M
 	if err != nil {
 		return nil, err
 	}
-	rebalanceTimeout := cfg.BatchTimeout + cfg.CommitTimeout + 10*time.Second
+	sessionTimeout := time.Duration(cfg.Kafka.SessionTimeoutMS) * time.Millisecond
+	heartbeatInterval := min(3*time.Second, sessionTimeout/3)
+	brokerMaxReadBytes := max(100*1024*1024, cfg.Kafka.FetchMaxBytes+1024*1024)
+	resetOffset := kgo.NewOffset().AtStart()
+	switch cfg.Kafka.AutoOffsetReset {
+	case "latest":
+		resetOffset = kgo.NewOffset().AtEnd()
+	case "none":
+		resetOffset = kgo.NoResetOffset()
+	}
+	startOffset := resetOffset
+	if cfg.Kafka.AutoOffsetReset == "none" {
+		startOffset = kgo.NewOffset().AtCommitted()
+	}
+	compression := compressionCodec(cfg.Kafka.CompressionType)
 	options := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Kafka.Brokers...),
 		kgo.ConsumerGroup(cfg.Kafka.GroupID + "." + topic.Name),
 		kgo.ConsumeTopics(topic.Name),
 		kgo.DisableAutoCommit(),
 		kgo.BlockRebalanceOnPoll(),
-		kgo.RebalanceTimeout(rebalanceTimeout),
+		kgo.ConsumeStartOffset(startOffset),
+		kgo.ConsumeResetOffset(resetOffset),
+		kgo.FetchMinBytes(int32(cfg.Kafka.FetchMinBytes)),
+		kgo.FetchMaxBytes(int32(cfg.Kafka.FetchMaxBytes)),
+		kgo.BrokerMaxReadBytes(int32(brokerMaxReadBytes)),
+		kgo.RebalanceTimeout(time.Duration(cfg.Kafka.MaxPollIntervalMS) * time.Millisecond),
+		kgo.SessionTimeout(sessionTimeout),
+		kgo.HeartbeatInterval(heartbeatInterval),
+		kgo.ProducerBatchCompression(compression),
 	}
 	if tlsConfig != nil {
 		options = append(options, kgo.DialTLSConfig(tlsConfig))
@@ -98,6 +120,21 @@ func (c *Client) CloseAllowingRebalance() {
 	defer cancel()
 	_ = c.client.LeaveGroupContext(ctx)
 	c.client.Close()
+}
+
+func compressionCodec(compressionType string) kgo.CompressionCodec {
+	switch compressionType {
+	case "none":
+		return kgo.NoCompression()
+	case "gzip":
+		return kgo.GzipCompression()
+	case "snappy":
+		return kgo.SnappyCompression()
+	case "zstd":
+		return kgo.ZstdCompression()
+	default:
+		return kgo.Lz4Compression()
+	}
 }
 
 func authMechanism(ctx context.Context, cfg consumer.KafkaConfig) (sasl.Mechanism, error) {

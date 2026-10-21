@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -35,7 +36,7 @@ func TestRunRejectsInvalidDependenciesAndConfig(t *testing.T) {
 
 func TestRunCommitsWholeBatchAfterUnorderedHandlersSucceed(t *testing.T) {
 	cfg := testConfig()
-	cfg.BatchSize = 2
+	cfg.Kafka.MaxPollRecords = 2
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	batch := testMessages(2)
@@ -46,8 +47,8 @@ func TestRunCommitsWholeBatchAfterUnorderedHandlersSucceed(t *testing.T) {
 	commitObserved := make(chan []Message, 1)
 	consumerClient := &testClient{
 		poll: func(ctx context.Context, maxRecords int) ([]Message, error) {
-			if maxRecords != cfg.BatchSize {
-				return nil, fmt.Errorf("poll max records = %d, want %d", maxRecords, cfg.BatchSize)
+			if maxRecords != cfg.Kafka.MaxPollRecords {
+				return nil, fmt.Errorf("poll max records = %d, want %d", maxRecords, cfg.Kafka.MaxPollRecords)
 			}
 			if pollCount.Add(1) == 1 {
 				return batch, nil
@@ -204,44 +205,46 @@ func TestRunUsesOneConcurrencyLimitAcrossClients(t *testing.T) {
 	}
 }
 
-func TestRunHandlerFailureDoesNotCommitAndCancelsBatch(t *testing.T) {
+func TestRunCommitsFailedBatchAfterEveryHandlerCompletes(t *testing.T) {
 	cfg := testConfig()
-	batch := testMessages(3)
-	handlerFailure := errors.New("handler failed")
-	var commitCount atomic.Int32
-	var canceledHandler atomic.Bool
-	started := make(chan struct{}, 2)
+	cfg.ProcessingConcurrency = 1
+	batch := testMessages(4)
+	firstFailure := errors.New("first handler failed")
+	secondFailure := errors.New("second handler failed")
+	var finished atomic.Int32
+	var commits atomic.Int32
 	consumerClient := &testClient{
 		poll: func(context.Context, int) ([]Message, error) { return batch, nil },
-		commit: func(context.Context, ...Message) error {
-			commitCount.Add(1)
+		commit: func(_ context.Context, messages ...Message) error {
+			if finished.Load() != int32(len(batch)) || len(messages) != len(batch) {
+				return fmt.Errorf("commit before all four handling attempts completed")
+			}
+			commits.Add(1)
 			return nil
 		},
 	}
-	err := Run(context.Background(), cfg, func(ctx context.Context, message Message) error {
-		if message.Offset == 0 {
-			for range 2 {
-				select {
-				case <-started:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-			return handlerFailure
+	err := Run(t.Context(), cfg, func(ctx context.Context, message Message) error {
+		if ctx.Err() != nil {
+			return fmt.Errorf("ordinary handler failure canceled a sibling: %w", ctx.Err())
 		}
-		started <- struct{}{}
-		<-ctx.Done()
-		canceledHandler.Store(true)
-		return ctx.Err()
+		finished.Add(1)
+		switch message.Offset {
+		case 0:
+			return firstFailure
+		case 2:
+			return secondFailure
+		default:
+			return nil
+		}
 	}, func(Config, TopicConfig) (*testClient, error) { return consumerClient, nil })
-	if !errors.Is(err, handlerFailure) {
-		t.Fatalf("Run() error = %v, want handler failure", err)
+	if !errors.Is(err, firstFailure) || !errors.Is(err, secondFailure) {
+		t.Fatalf("Run() error = %v, want both handler failures", err)
 	}
-	if got := commitCount.Load(); got != 0 {
-		t.Errorf("committed %d failed batches, want none", got)
+	if got := commits.Load(); got != 1 {
+		t.Errorf("committed %d completed failed batches, want 1", got)
 	}
-	if !canceledHandler.Load() {
-		t.Error("handler failure did not cancel the other handler in the batch")
+	if got := finished.Load(); got != int32(len(batch)) {
+		t.Errorf("finished %d handling attempts, want %d", got, len(batch))
 	}
 	if got := consumerClient.allowCount.Load(); got != 1 {
 		t.Errorf("AllowRebalance() called %d times, want 1", got)
@@ -322,13 +325,81 @@ func TestRunCommitFailureReturnsError(t *testing.T) {
 	}
 }
 
+func TestRunReportsHandlerAndCommitFailures(t *testing.T) {
+	cfg := testConfig()
+	handlerFailure := errors.New("handler failed")
+	commitFailure := errors.New("commit failed")
+	client := &testClient{
+		poll:   func(context.Context, int) ([]Message, error) { return testMessages(1), nil },
+		commit: func(context.Context, ...Message) error { return commitFailure },
+	}
+	err := Run(t.Context(), cfg, func(context.Context, Message) error { return handlerFailure },
+		func(Config, TopicConfig) (*testClient, error) { return client, nil })
+	if !errors.Is(err, handlerFailure) || !errors.Is(err, commitFailure) {
+		t.Fatalf("Run() error = %v, want both handler and commit failures", err)
+	}
+}
+
+func TestRunDeadlinesLeaveUnfinishedBatchesUncommitted(t *testing.T) {
+	for _, deadline := range []string{"batch", "poll interval"} {
+		t.Run(deadline, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cfg := testConfig()
+				cfg.ProcessingConcurrency = 1
+				if deadline == "batch" {
+					cfg.BatchTimeout = 20 * time.Millisecond
+				} else {
+					cfg.Kafka.MaxPollIntervalMS = 100
+				}
+				var started, commits atomic.Int32
+				client := &testClient{
+					poll:   func(context.Context, int) ([]Message, error) { return testMessages(3), nil },
+					commit: func(context.Context, ...Message) error { commits.Add(1); return nil },
+				}
+				err := Run(t.Context(), cfg, func(ctx context.Context, _ Message) error {
+					started.Add(1)
+					<-ctx.Done()
+					return ctx.Err()
+				}, func(Config, TopicConfig) (*testClient, error) { return client, nil })
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Run() error = %v, want deadline exceeded", err)
+				}
+				if started.Load() != 1 || commits.Load() != 0 {
+					t.Fatalf("started %d handlers, committed %d incomplete batches", started.Load(), commits.Load())
+				}
+			})
+		})
+	}
+}
+
+func TestRunPollIntervalAlsoBoundsCommit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testConfig()
+		cfg.Kafka.MaxPollIntervalMS = 100
+		cfg.CommitTimeout = time.Second
+		start := time.Now()
+		client := &testClient{
+			poll:   func(context.Context, int) ([]Message, error) { return testMessages(1), nil },
+			commit: func(ctx context.Context, _ ...Message) error { <-ctx.Done(); return ctx.Err() },
+		}
+		err := Run(t.Context(), cfg, func(context.Context, Message) error {
+			time.Sleep(40 * time.Millisecond)
+			return nil
+		}, func(Config, TopicConfig) (*testClient, error) { return client, nil })
+		if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) != 100*time.Millisecond {
+			t.Fatalf("Run() = %v after %s, want total processing-plus-commit deadline of 100ms", err, time.Since(start))
+		}
+	})
+}
+
 func TestRunCancellationLeavesBatchUncommitted(t *testing.T) {
 	cfg := testConfig()
+	cfg.ProcessingConcurrency = 1
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})
 	var commits atomic.Int32
 	consumerClient := &testClient{
-		poll: func(context.Context, int) ([]Message, error) { return testMessages(1), nil },
+		poll: func(context.Context, int) ([]Message, error) { return testMessages(3), nil },
 		commit: func(context.Context, ...Message) error {
 			commits.Add(1)
 			return nil

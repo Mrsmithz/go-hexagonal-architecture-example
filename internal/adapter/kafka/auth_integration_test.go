@@ -81,7 +81,7 @@ func TestKafkaPasswordAuthenticationIntegration(t *testing.T) {
 		})
 	}()
 	waitForMessages(t, done, received, 1)
-	waitForCommits(t, done, commits, 1, cfg.BatchSize)
+	waitForCommits(t, done, commits, 1, cfg.Kafka.MaxPollRecords)
 	cancel()
 	waitForRun(t, done)
 

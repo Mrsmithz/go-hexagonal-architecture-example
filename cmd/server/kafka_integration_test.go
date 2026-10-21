@@ -66,7 +66,7 @@ func TestServerRunsKafkaAlongsideHTTP(t *testing.T) {
 		}
 	}
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	yaml := fmt.Sprintf("kafka:\n  enabled: true\n  brokers: [%q]\n  group_id: fx-server\n  allow_insecure: true\n  tls:\n    enabled: false\ntopics:\n  - name: %s\n    consumers: 2\nbatch_size: 2\nprocessing_concurrency: 2\n", brokers[0], topic)
+	yaml := fmt.Sprintf("kafka:\n  enabled: true\n  brokers: [%q]\n  group_id: fx-server\n  max.poll.records: 2\n  allow_insecure: true\n  tls:\n    enabled: false\ntopics:\n  - name: %s\n    consumers: 2\nprocessing_concurrency: 2\n", brokers[0], topic)
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}

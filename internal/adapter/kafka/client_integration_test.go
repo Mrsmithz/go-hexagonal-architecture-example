@@ -3,9 +3,12 @@
 package kafka
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,7 +34,7 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 
 		cfg := integrationConfig(brokers, topic, "integration-distribution-group")
 		cfg.Topics[0].Consumers = 2
-		cfg.BatchSize = 3
+		cfg.Kafka.MaxPollRecords = 3
 		cfg.ProcessingConcurrency = 2
 		started, cancel := context.WithCancel(ctx)
 		t.Cleanup(cancel)
@@ -123,7 +126,7 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		}
 		produceRecords(t, ctx, brokers, topic, recordsCount, 2)
 		waitForMessages(t, done, received, recordsCount)
-		committed := waitForCommits(t, done, commitSizes, recordsCount, cfg.BatchSize)
+		committed := waitForCommits(t, done, commitSizes, recordsCount, cfg.Kafka.MaxPollRecords)
 		if committed != recordsCount {
 			t.Fatalf("committed %d records, want %d", committed, recordsCount)
 		}
@@ -154,51 +157,48 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("failed batch is replayed and not committed", func(t *testing.T) {
+	t.Run("completed failures are committed and do not replay", func(t *testing.T) {
 		topic := "integration-replay"
 		createTopic(t, ctx, container, topic, 1)
 		produceRecords(t, ctx, brokers, topic, 5, 1)
 		cfg := integrationConfig(brokers, topic, "integration-replay-group")
-		cfg.BatchSize = 3
-		cfg.ProcessingConcurrency = 3
-		failedOffset := make(chan int64, 1)
-		var failedRunCommits atomic.Int32
+		cfg.Kafka.MaxPollRecords = 3
+		cfg.ProcessingConcurrency = 1
+		var finished, failedRunCommits atomic.Int32
 		firstFactory, err := NewClientFactory(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		firstRun := make(chan error, 1)
 		go func() {
-			firstRun <- consumer.Run(ctx, cfg, func(_ context.Context, message consumer.Message) error {
-				select {
-				case failedOffset <- message.Offset:
-				default:
-				}
+			firstRun <- consumer.Run(ctx, cfg, func(context.Context, consumer.Message) error {
+				finished.Add(1)
 				return fmt.Errorf("intentional failure")
 			}, func(config consumer.Config, topicConfig consumer.TopicConfig) (*observedClient, error) {
 				client, err := firstFactory(config, topicConfig)
 				if err != nil {
 					return nil, err
 				}
-				return &observedClient{Client: client, onCommit: func([]consumer.Message) error {
-					failedRunCommits.Add(1)
+				return &observedClient{Client: client, onCommit: func(messages []consumer.Message) error {
+					if finished.Load() != int32(len(messages)) {
+						return fmt.Errorf("committed before every handling attempt finished")
+					}
+					failedRunCommits.Add(int32(len(messages)))
 					return nil
 				}}, nil
 			})
 		}()
-		var replayedOffset int64
 		select {
-		case replayedOffset = <-failedOffset:
 		case err := <-firstRun:
-			t.Fatalf("first run stopped before a handler failed: %v", err)
-		case <-time.After(30 * time.Second):
-			t.Fatal("timed out waiting for failing batch")
+			if err == nil {
+				t.Fatal("first run error = nil, want handler failure after commit")
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
-		if err := <-firstRun; err == nil {
-			t.Fatal("first run error = nil, want handler failure")
-		}
-		if got := failedRunCommits.Load(); got != 0 {
-			t.Fatalf("failed run committed %d batches, want none", got)
+		committedFailures := int(failedRunCommits.Load())
+		if committedFailures < 1 || committedFailures > cfg.Kafka.MaxPollRecords {
+			t.Fatalf("committed %d completed failures, want between 1 and %d", committedFailures, cfg.Kafka.MaxPollRecords)
 		}
 
 		retryCtx, cancelRetry := context.WithCancel(ctx)
@@ -225,24 +225,22 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 				}}, nil
 			})
 		}()
-		replayed := make(map[int64]bool)
-		for range 5 {
+		remaining := 5 - committedFailures
+		received := make(map[int64]bool)
+		for range remaining {
 			select {
 			case offset := <-retryReceived:
-				replayed[offset] = true
+				if offset < int64(committedFailures) || received[offset] {
+					t.Fatalf("restart replayed committed failure or duplicate offset %d", offset)
+				}
+				received[offset] = true
 			case err := <-retryDone:
 				t.Fatalf("retry stopped before delivering all records: %v", err)
 			case <-time.After(30 * time.Second):
 				t.Fatal("timed out waiting for replayed records")
 			}
 		}
-		if !replayed[replayedOffset] {
-			t.Errorf("failed offset %d was not replayed; got offsets %v", replayedOffset, replayed)
-		}
-		committed := waitForCommits(t, retryDone, retryCommitted, 5, cfg.BatchSize)
-		if committed != 5 {
-			t.Errorf("retry committed %d records, want 5", committed)
-		}
+		waitForCommits(t, retryDone, retryCommitted, remaining, cfg.Kafka.MaxPollRecords)
 		cancelRetry()
 		waitForRun(t, retryDone)
 	})
@@ -254,6 +252,7 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		cfg := integrationConfig(brokers, topic, "integration-restart-group")
 		for run := range 2 {
 			if run == 1 {
+				cfg.Kafka.AutoOffsetReset = "none"
 				produceRecords(t, ctx, brokers, topic, 1, 1)
 			}
 			runCtx, cancel := context.WithCancel(ctx)
@@ -296,7 +295,7 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 					t.Fatal(ctx.Err())
 				}
 			}
-			waitForCommits(t, done, commits, want, cfg.BatchSize)
+			waitForCommits(t, done, commits, want, cfg.Kafka.MaxPollRecords)
 			cancel()
 			waitForRun(t, done)
 		}
@@ -343,6 +342,88 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		waitForRun(t, done)
 		if got := commits.Load(); got != 0 {
 			t.Errorf("canceled batch committed %d times, want 0", got)
+		}
+	})
+
+	t.Run("none offset reset requires prior committed offsets", func(t *testing.T) {
+		const topic = "integration-no-reset"
+		createTopic(t, ctx, container, topic, 1)
+		produceRecords(t, ctx, brokers, topic, 3, 1)
+		cfg := integrationConfig(brokers, topic, "integration-no-reset-group")
+		cfg.Kafka.AutoOffsetReset = "none"
+		runCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		factory, err := NewClientFactory(runCtx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var processed atomic.Int32
+		err = consumer.Run(runCtx, cfg, func(context.Context, consumer.Message) error {
+			processed.Add(1)
+			return nil
+		}, factory)
+		if err == nil || !strings.Contains(err.Error(), "partition has no prior committed offset") {
+			t.Fatalf("Run() error = %v, want missing committed offset error", err)
+		}
+		if processed.Load() != 0 {
+			t.Fatalf("processed %d records without committed offsets", processed.Load())
+		}
+	})
+
+	t.Run("latest offset reset skips existing records", func(t *testing.T) {
+		const topic = "integration-latest"
+		createTopic(t, ctx, container, topic, 1)
+		produceRecords(t, ctx, brokers, topic, 3, 1)
+		cfg := integrationConfig(brokers, topic, "integration-latest-group")
+		cfg.Kafka.AutoOffsetReset = "latest"
+		factory, err := NewClientFactory(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, err := factory(cfg, cfg.Topics[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.CloseAllowingRebalance()
+		initialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		messages, err := client.Poll(initialCtx, 1)
+		cancel()
+		client.AllowRebalance()
+		member, generation := client.client.GroupMetadata()
+		if len(messages) != 0 || !errors.Is(err, context.DeadlineExceeded) || member == "" || generation < 0 {
+			t.Fatalf("initial latest poll = %v, %v; group member %q generation %d", messages, err, member, generation)
+		}
+		produceRecords(t, ctx, brokers, topic, 1, 1)
+		messages, err = client.Poll(ctx, 1)
+		if err != nil || len(messages) != 1 || messages[0].Offset != 3 {
+			t.Fatalf("latest poll = %v, %v, want only new offset 3", messages, err)
+		}
+	})
+
+	t.Run("default client produces LZ4 and decodes compressed records", func(t *testing.T) {
+		const topic = "integration-lz4"
+		createTopic(t, ctx, container, topic, 1)
+		cfg := integrationConfig(brokers, topic, "integration-lz4-group")
+		factory, err := NewClientFactory(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, err := factory(cfg, cfg.Topics[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.CloseAllowingRebalance()
+		value := bytes.Repeat([]byte("LZ4 payload "), 1000)
+		if err := client.client.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: value}).FirstErr(); err != nil {
+			t.Fatal(err)
+		}
+		fetches := client.client.PollRecords(ctx, 1)
+		if errs := fetches.Errors(); len(errs) > 0 {
+			t.Fatal(errs)
+		}
+		records := fetches.Records()
+		if len(records) != 1 || !bytes.Equal(records[0].Value, value) || records[0].Attrs.CompressionType() != 3 {
+			t.Fatalf("consumed records = %v, want original payload with LZ4 batch attributes", records)
 		}
 	})
 

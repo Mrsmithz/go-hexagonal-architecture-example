@@ -94,7 +94,7 @@ func runClient(ctx context.Context, cfg Config, handler Handler, client client, 
 		if ctx.Err() != nil {
 			return nil
 		}
-		records, err := client.Poll(ctx, cfg.BatchSize)
+		records, err := client.Poll(ctx, cfg.Kafka.MaxPollRecords)
 		if err != nil {
 			client.AllowRebalance()
 			if ctx.Err() != nil {
@@ -107,63 +107,66 @@ func runClient(ctx context.Context, cfg Config, handler Handler, client client, 
 			continue
 		}
 
-		batchCtx, cancelBatch := context.WithTimeout(ctx, cfg.BatchTimeout)
-		processErr := processBatch(batchCtx, records, handler, semaphore)
-		cancelBatch()
-		if processErr != nil {
-			client.AllowRebalance()
+		if err := processAndCommitBatch(ctx, cfg, records, handler, client, semaphore); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("process batch: %w", processErr)
-		}
-		if ctx.Err() != nil {
-			client.AllowRebalance()
-			return nil
-		}
-
-		commitCtx, cancelCommit := context.WithTimeout(ctx, cfg.CommitTimeout)
-		commitErr := client.Commit(commitCtx, records...)
-		cancelCommit()
-		client.AllowRebalance()
-		if commitErr != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return fmt.Errorf("commit batch: %w", commitErr)
+			return err
 		}
 	}
 }
 
+func processAndCommitBatch(ctx context.Context, cfg Config, records []Message, handler Handler, client client, semaphore chan struct{}) error {
+	defer client.AllowRebalance()
+	pollCtx, cancelPoll := context.WithTimeout(ctx, time.Duration(cfg.Kafka.MaxPollIntervalMS)*time.Millisecond)
+	defer cancelPoll()
+	batchCtx, cancelBatch := context.WithTimeout(pollCtx, cfg.BatchTimeout)
+	processErr := processBatch(batchCtx, records, handler, semaphore)
+	batchErr := batchCtx.Err()
+	cancelBatch()
+	if batchErr != nil {
+		return fmt.Errorf("incomplete batch: %w", errors.Join(batchErr, processErr))
+	}
+	if err := pollCtx.Err(); err != nil {
+		return fmt.Errorf("incomplete batch: %w", errors.Join(err, processErr))
+	}
+
+	commitCtx, cancelCommit := context.WithTimeout(pollCtx, cfg.CommitTimeout)
+	commitErr := client.Commit(commitCtx, records...)
+	cancelCommit()
+	if commitErr != nil {
+		return errors.Join(fmt.Errorf("commit batch: %w", commitErr), processErr)
+	}
+	if processErr != nil {
+		return fmt.Errorf("process batch (offsets committed): %w", processErr)
+	}
+	return nil
+}
+
 func processBatch(ctx context.Context, records []Message, handler Handler, semaphore chan struct{}) error {
-	processCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	var handlers sync.WaitGroup
 	var errorMu sync.Mutex
-	var firstError error
+	var handlerErrors []error
 	for _, record := range records {
 		handlers.Go(func() {
 			select {
 			case semaphore <- struct{}{}:
-			case <-processCtx.Done():
+			case <-ctx.Done():
 				return
 			}
 			defer func() { <-semaphore }()
-			if err := handler(processCtx, record); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := handler(ctx, record); err != nil {
 				errorMu.Lock()
-				if firstError == nil {
-					firstError = err
-				}
+				handlerErrors = append(handlerErrors, fmt.Errorf("handle %s partition %d offset %d: %w", record.Topic, record.Partition, record.Offset, err))
 				errorMu.Unlock()
-				cancel()
 			}
 		})
 	}
 	handlers.Wait()
-	if firstError != nil {
-		return firstError
-	}
-	return processCtx.Err()
+	return errors.Join(handlerErrors...)
 }
 
 func closeClients(clients []client) {

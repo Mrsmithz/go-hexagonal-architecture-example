@@ -3,7 +3,6 @@ package consumer
 import (
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"os"
 	"regexp"
@@ -28,21 +27,28 @@ const (
 type Config struct {
 	Kafka                 KafkaConfig   `koanf:"kafka"`
 	Topics                []TopicConfig `koanf:"topics"`
-	BatchSize             int           `koanf:"batch_size"`
 	ProcessingConcurrency int           `koanf:"processing_concurrency"`
 	BatchTimeout          time.Duration `koanf:"batch_timeout"`
 	CommitTimeout         time.Duration `koanf:"commit_timeout"`
 }
 
 type KafkaConfig struct {
-	Enabled       bool      `koanf:"enabled"`
-	Brokers       []string  `koanf:"brokers"`
-	GroupID       string    `koanf:"group_id"`
-	Auth          string    `koanf:"auth"`
-	Username      string    `koanf:"username"`
-	Password      string    `koanf:"password"`
-	TLS           TLSConfig `koanf:"tls"`
-	AllowInsecure bool      `koanf:"allow_insecure"`
+	Enabled           bool      `koanf:"enabled"`
+	Brokers           []string  `koanf:"brokers"`
+	GroupID           string    `koanf:"group_id"`
+	Auth              string    `koanf:"auth"`
+	Username          string    `koanf:"username"`
+	Password          string    `koanf:"password"`
+	TLS               TLSConfig `koanf:"tls"`
+	AllowInsecure     bool      `koanf:"allow_insecure"`
+	AutoOffsetReset   string    `koanf:"auto.offset.reset"`
+	FetchMinBytes     int       `koanf:"fetch.min.bytes"`
+	FetchMaxBytes     int       `koanf:"fetch.max.bytes"`
+	MaxPollRecords    int       `koanf:"max.poll.records"`
+	MaxPollIntervalMS int       `koanf:"max.poll.interval.ms"`
+	SessionTimeoutMS  int       `koanf:"session.timeout.ms"`
+	// CompressionType configures producer batch compression; it does not affect consumer decompression.
+	CompressionType string `koanf:"compression.type"`
 }
 
 type TLSConfig struct {
@@ -59,13 +65,19 @@ type TopicConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		Kafka: KafkaConfig{
-			Brokers: []string{"localhost:9092"},
-			GroupID: "go-backend-consumer",
-			Auth:    AuthNone,
-			TLS:     TLSConfig{Enabled: true},
+			Brokers:           []string{"localhost:9092"},
+			GroupID:           "go-backend-consumer",
+			Auth:              AuthNone,
+			TLS:               TLSConfig{Enabled: true},
+			AutoOffsetReset:   "earliest",
+			FetchMinBytes:     1,
+			FetchMaxBytes:     50 * 1024 * 1024,
+			MaxPollRecords:    50,
+			MaxPollIntervalMS: 300_000,
+			SessionTimeoutMS:  45_000,
+			CompressionType:   "lz4",
 		},
 		Topics:                []TopicConfig{{Name: "greetings", Consumers: 1}},
-		BatchSize:             50,
 		ProcessingConcurrency: 10,
 		BatchTimeout:          30 * time.Second,
 		CommitTimeout:         10 * time.Second,
@@ -86,13 +98,20 @@ func loadConfig(path string, lookupEnv func(string) (string, bool)) (Config, err
 	}
 	values := map[string]any{
 		"kafka": map[string]any{
-			"enabled":        defaults.Kafka.Enabled,
-			"brokers":        defaults.Kafka.Brokers,
-			"group_id":       defaults.Kafka.GroupID,
-			"auth":           defaults.Kafka.Auth,
-			"username":       defaults.Kafka.Username,
-			"password":       defaults.Kafka.Password,
-			"allow_insecure": defaults.Kafka.AllowInsecure,
+			"enabled":              defaults.Kafka.Enabled,
+			"brokers":              defaults.Kafka.Brokers,
+			"group_id":             defaults.Kafka.GroupID,
+			"auth":                 defaults.Kafka.Auth,
+			"username":             defaults.Kafka.Username,
+			"password":             defaults.Kafka.Password,
+			"allow_insecure":       defaults.Kafka.AllowInsecure,
+			"auto.offset.reset":    defaults.Kafka.AutoOffsetReset,
+			"fetch.min.bytes":      defaults.Kafka.FetchMinBytes,
+			"fetch.max.bytes":      defaults.Kafka.FetchMaxBytes,
+			"max.poll.records":     defaults.Kafka.MaxPollRecords,
+			"max.poll.interval.ms": defaults.Kafka.MaxPollIntervalMS,
+			"session.timeout.ms":   defaults.Kafka.SessionTimeoutMS,
+			"compression.type":     defaults.Kafka.CompressionType,
 			"tls": map[string]any{
 				"enabled":     defaults.Kafka.TLS.Enabled,
 				"ca_file":     defaults.Kafka.TLS.CAFile,
@@ -100,13 +119,12 @@ func loadConfig(path string, lookupEnv func(string) (string, bool)) (Config, err
 			},
 		},
 		"topics":                 []map[string]any{{"name": defaults.Topics[0].Name, "consumers": defaults.Topics[0].Consumers}},
-		"batch_size":             defaults.BatchSize,
 		"processing_concurrency": defaults.ProcessingConcurrency,
 		"batch_timeout":          defaults.BatchTimeout.String(),
 		"commit_timeout":         defaults.CommitTimeout.String(),
 	}
-	k := koanf.NewWithConf(koanf.Conf{Delim: "."})
-	if err := k.Load(confmap.Provider(values, "."), nil); err != nil {
+	k := koanf.NewWithConf(koanf.Conf{Delim: "::"})
+	if err := k.Load(confmap.Provider(values, "::"), nil); err != nil {
 		return Config{}, fmt.Errorf("load defaults: %w", err)
 	}
 	if err := k.Load(file.Provider(path), yaml.Parser()); err != nil {
@@ -114,13 +132,13 @@ func loadConfig(path string, lookupEnv func(string) (string, bool)) (Config, err
 	}
 	secrets := map[string]any{}
 	if username, ok := lookupEnv("KAFKA_USERNAME"); ok {
-		secrets["kafka.username"] = username
+		secrets["kafka::username"] = username
 	}
 	if password, ok := lookupEnv("KAFKA_PASSWORD"); ok {
-		secrets["kafka.password"] = password
+		secrets["kafka::password"] = password
 	}
 	if len(secrets) > 0 {
-		if err := k.Load(confmap.Provider(secrets, "."), nil); err != nil {
+		if err := k.Load(confmap.Provider(secrets, "::"), nil); err != nil {
 			return Config{}, fmt.Errorf("load environment overrides: %w", err)
 		}
 	}
@@ -155,8 +173,32 @@ func (cfg Config) Validate() error {
 	if strings.TrimSpace(cfg.Kafka.GroupID) == "" {
 		return fmt.Errorf("kafka.group_id must not be empty")
 	}
-	if cfg.BatchSize <= 0 {
-		return fmt.Errorf("batch_size must be positive")
+	switch cfg.Kafka.AutoOffsetReset {
+	case "earliest", "latest", "none":
+	default:
+		return fmt.Errorf("kafka.auto.offset.reset has unsupported value %q", cfg.Kafka.AutoOffsetReset)
+	}
+	if cfg.Kafka.FetchMinBytes < 0 || cfg.Kafka.FetchMinBytes > cfg.Kafka.FetchMaxBytes {
+		return fmt.Errorf("kafka.fetch.min.bytes must be between 0 and kafka.fetch.max.bytes")
+	}
+	const maxFetchBytes = 1<<30 - 1<<20
+	if cfg.Kafka.FetchMaxBytes <= 0 || cfg.Kafka.FetchMaxBytes > maxFetchBytes {
+		return fmt.Errorf("kafka.fetch.max.bytes must be positive and at most %d", maxFetchBytes)
+	}
+	if cfg.Kafka.MaxPollRecords <= 0 {
+		return fmt.Errorf("kafka.max.poll.records must be positive")
+	}
+	const maxKafkaMillis = int64(1<<31 - 1)
+	if cfg.Kafka.MaxPollIntervalMS < 100 || int64(cfg.Kafka.MaxPollIntervalMS) > maxKafkaMillis {
+		return fmt.Errorf("kafka.max.poll.interval.ms must be between 100 and %d", maxKafkaMillis)
+	}
+	if cfg.Kafka.SessionTimeoutMS < 100 || int64(cfg.Kafka.SessionTimeoutMS) > maxKafkaMillis {
+		return fmt.Errorf("kafka.session.timeout.ms must be between 100 and %d", maxKafkaMillis)
+	}
+	switch cfg.Kafka.CompressionType {
+	case "none", "gzip", "snappy", "lz4", "zstd":
+	default:
+		return fmt.Errorf("kafka.compression.type has unsupported value %q", cfg.Kafka.CompressionType)
 	}
 	if cfg.ProcessingConcurrency <= 0 {
 		return fmt.Errorf("processing_concurrency must be positive")
@@ -166,14 +208,6 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.CommitTimeout <= 0 {
 		return fmt.Errorf("commit_timeout must be positive")
-	}
-	const safetyWindow = 10 * time.Second
-	if cfg.BatchTimeout > time.Duration(math.MaxInt64)-cfg.CommitTimeout-safetyWindow {
-		return fmt.Errorf("batch_timeout and commit_timeout exceed the supported duration")
-	}
-	rebalanceTimeout := cfg.BatchTimeout + cfg.CommitTimeout + safetyWindow
-	if rebalanceTimeout > time.Duration(1<<31-1)*time.Millisecond {
-		return fmt.Errorf("batch_timeout and commit_timeout exceed Kafka's rebalance timeout limit")
 	}
 	if len(cfg.Topics) == 0 {
 		return fmt.Errorf("topics must contain at least one topic")

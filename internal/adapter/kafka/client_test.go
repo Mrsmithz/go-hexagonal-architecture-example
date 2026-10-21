@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -104,6 +105,90 @@ func TestBuildTLSConfig(t *testing.T) {
 			t.Fatal("buildTLSConfig() error = nil, want invalid certificate error")
 		}
 	})
+}
+
+func TestNewClientAppliesKafkaNativeOptions(t *testing.T) {
+	tests := []struct {
+		name            string
+		offsetReset     string
+		compressionType string
+		fetchMaxBytes   int
+		sessionTimeout  int
+		pollInterval    int
+	}{
+		{name: "earliest lz4 defaults", offsetReset: "earliest", compressionType: "lz4", fetchMaxBytes: 50 * 1024 * 1024, sessionTimeout: 45_000, pollInterval: 300_000},
+		{name: "latest gzip", offsetReset: "latest", compressionType: "gzip", fetchMaxBytes: 1_048_576, sessionTimeout: 9_000, pollInterval: 120_000},
+		{name: "none snappy", offsetReset: "none", compressionType: "snappy", fetchMaxBytes: 1<<30 - 1<<20, sessionTimeout: 100, pollInterval: 100},
+		{name: "zstd", offsetReset: "earliest", compressionType: "zstd", fetchMaxBytes: 50 * 1024 * 1024, sessionTimeout: 45_000, pollInterval: 300_000},
+		{name: "no compression", offsetReset: "earliest", compressionType: "none", fetchMaxBytes: 50 * 1024 * 1024, sessionTimeout: 45_000, pollInterval: 300_000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := consumer.DefaultConfig()
+			cfg.Kafka.AutoOffsetReset = tt.offsetReset
+			cfg.Kafka.CompressionType = tt.compressionType
+			cfg.Kafka.FetchMinBytes = 0
+			cfg.Kafka.FetchMaxBytes = tt.fetchMaxBytes
+			cfg.Kafka.SessionTimeoutMS = tt.sessionTimeout
+			cfg.Kafka.MaxPollIntervalMS = tt.pollInterval
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+			client, err := newClient(cfg, cfg.Topics[0], nil)
+			if err != nil {
+				t.Fatalf("newClient() error = %v", err)
+			}
+			defer client.client.Close()
+
+			wantOffset := kgo.NewOffset().AtStart()
+			switch tt.offsetReset {
+			case "latest":
+				wantOffset = kgo.NewOffset().AtEnd()
+			case "none":
+				wantOffset = kgo.NoResetOffset()
+			}
+			if got := client.client.OptValue(kgo.ConsumeResetOffset); !reflect.DeepEqual(got, wantOffset) {
+				t.Errorf("ConsumeResetOffset = %#v, want %#v", got, wantOffset)
+			}
+			if tt.offsetReset == "none" {
+				wantOffset = kgo.NewOffset().AtCommitted()
+			}
+			if got := client.client.OptValue(kgo.ConsumeStartOffset); !reflect.DeepEqual(got, wantOffset) {
+				t.Errorf("ConsumeStartOffset = %#v, want %#v", got, wantOffset)
+			}
+			if got := client.client.OptValue(kgo.FetchMinBytes); got != int32(0) {
+				t.Errorf("FetchMinBytes = %v, want 0", got)
+			}
+			if got := client.client.OptValue(kgo.FetchMaxBytes); got != int32(tt.fetchMaxBytes) {
+				t.Errorf("FetchMaxBytes = %v, want %d", got, tt.fetchMaxBytes)
+			}
+			wantBrokerMaxReadBytes := max(100*1024*1024, tt.fetchMaxBytes+1024*1024)
+			if got := client.client.OptValue(kgo.BrokerMaxReadBytes); got != int32(wantBrokerMaxReadBytes) {
+				t.Errorf("BrokerMaxReadBytes = %v, want %d", got, wantBrokerMaxReadBytes)
+			}
+			if got := client.client.OptValue(kgo.RebalanceTimeout); got != time.Duration(tt.pollInterval)*time.Millisecond {
+				t.Errorf("RebalanceTimeout = %v, want %v", got, time.Duration(tt.pollInterval)*time.Millisecond)
+			}
+			if got := client.client.OptValue(kgo.SessionTimeout); got != time.Duration(tt.sessionTimeout)*time.Millisecond {
+				t.Errorf("SessionTimeout = %v, want %v", got, time.Duration(tt.sessionTimeout)*time.Millisecond)
+			}
+			wantHeartbeat := min(3*time.Second, time.Duration(tt.sessionTimeout)*time.Millisecond/3)
+			if got := client.client.OptValue(kgo.HeartbeatInterval); got != wantHeartbeat {
+				t.Errorf("HeartbeatInterval = %v, want %v", got, wantHeartbeat)
+			}
+			wantCompression := []kgo.CompressionCodec{compressionCodec(tt.compressionType)}
+			if got := client.client.OptValues(kgo.ProducerBatchCompression); len(got) != 1 || !reflect.DeepEqual(got[0], wantCompression) {
+				t.Errorf("ProducerBatchCompression = %#v, want %#v", got, wantCompression)
+			}
+			if got := client.client.OptValue(kgo.DisableAutoCommit); got != true {
+				t.Errorf("DisableAutoCommit = %v, want true", got)
+			}
+			if got := client.client.OptValue(kgo.BlockRebalanceOnPoll); got != true {
+				t.Errorf("BlockRebalanceOnPoll = %v, want true", got)
+			}
+		})
+	}
 }
 
 func TestNewClientFactoryValidatesContextAndConfig(t *testing.T) {
