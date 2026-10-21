@@ -23,7 +23,7 @@ func TestLoadConfig(t *testing.T) {
 					cfg.Kafka.AutoOffsetReset == "earliest" && cfg.Kafka.FetchMinBytes == 1 &&
 					cfg.Kafka.FetchMaxBytes == 50*1024*1024 && cfg.Kafka.MaxPollRecords == 50 &&
 					cfg.Kafka.MaxPollIntervalMS == 300_000 && cfg.Kafka.SessionTimeoutMS == 45_000 &&
-					cfg.Kafka.CompressionType == "lz4" && cfg.Topics[0] == (TopicConfig{Name: "greetings", Consumers: 1})
+					cfg.Kafka.CompressionType == "lz4" && cfg.Topics[0] == (TopicConfig{Name: "greetings", Consumers: 1, ProcessingConcurrency: 10, BatchTimeout: 30 * time.Second, CommitTimeout: 10 * time.Second})
 			},
 		},
 		{
@@ -43,14 +43,32 @@ func TestLoadConfig(t *testing.T) {
 			contents: "kafka:\n  enabled: true\n  brokers: [broker.example:9093]\n  group_id: app\n" +
 				"  auth: plain\n  username: alice\n  password: secret\n  max.poll.records: 8\n" +
 				"  tls:\n    enabled: true\n    ca_file: /tmp/ca.pem\n    server_name: kafka.example\n" +
-				"topics:\n  - name: events\n    consumers: 2\nprocessing_concurrency: 3\nbatch_timeout: 12s\ncommit_timeout: 2s\n",
+				"topics:\n  - name: events\n    consumers: 2\n    processing_concurrency: 3\n    batch_timeout: 12s\n    commit_timeout: 2s\n",
 			check: func(cfg Config) bool {
 				return cfg.Kafka.Brokers[0] == "broker.example:9093" && cfg.Kafka.GroupID == "app" &&
 					cfg.Kafka.Auth == AuthPlain && cfg.Kafka.TLS.CAFile == "/tmp/ca.pem" &&
 					cfg.Kafka.TLS.ServerName == "kafka.example" && cfg.Kafka.MaxPollRecords == 8 &&
-					cfg.Topics[0] == (TopicConfig{Name: "events", Consumers: 2}) &&
-					cfg.ProcessingConcurrency == 3 && cfg.BatchTimeout == 12*time.Second && cfg.CommitTimeout == 2*time.Second
+					cfg.Topics[0] == (TopicConfig{Name: "events", Consumers: 2, ProcessingConcurrency: 3, BatchTimeout: 12 * time.Second, CommitTimeout: 2 * time.Second})
 			},
+		},
+		{
+			name: "topic defaults are per topic and explicit values override them",
+			contents: "kafka:\n  enabled: true\ntopics:\n  - name: first\n    consumers: 1\n    processing_concurrency: 4\n    batch_timeout: 5s\n    commit_timeout: 6s\n" +
+				"  - name: second\n    consumers: 2\n",
+			check: func(cfg Config) bool {
+				return len(cfg.Topics) == 2 &&
+					cfg.Topics[0] == (TopicConfig{Name: "first", Consumers: 1, ProcessingConcurrency: 4, BatchTimeout: 5 * time.Second, CommitTimeout: 6 * time.Second}) &&
+					cfg.Topics[1] == (TopicConfig{Name: "second", Consumers: 2, ProcessingConcurrency: 10, BatchTimeout: 30 * time.Second, CommitTimeout: 10 * time.Second})
+			},
+		},
+		{name: "legacy global processing concurrency rejected when disabled", contents: "processing_concurrency: 3\n", wantErr: "invalid keys"},
+		{name: "legacy global batch timeout rejected when disabled", contents: "batch_timeout: 30s\n", wantErr: "invalid keys"},
+		{name: "legacy global commit timeout rejected when disabled", contents: "commit_timeout: 10s\n", wantErr: "invalid keys"},
+		{name: "topic consumers remain required", contents: "kafka:\n  enabled: true\ntopics:\n  - name: events\n", wantErr: "topics.events.consumers must be positive"},
+		{
+			name:     "unknown nested topic key rejected",
+			contents: "topics:\n  - name: events\n    consumers: 1\n    unrecognized: true\n",
+			wantErr:  "invalid keys",
 		},
 		{
 			name:     "nested spelling of literal dotted key rejected",
@@ -97,6 +115,12 @@ func TestLoadConfig(t *testing.T) {
 				return !cfg.Kafka.Enabled && cfg.Kafka.Auth == AuthAWSIAM && cfg.Kafka.FetchMinBytes == -1
 			},
 		},
+		{name: "zero topic processing concurrency", contents: "kafka:\n  enabled: true\ntopics:\n  - name: events\n    consumers: 1\n    processing_concurrency: 0\n", wantErr: "topics.events.processing_concurrency"},
+		{name: "negative topic processing concurrency", contents: "kafka:\n  enabled: true\ntopics:\n  - name: events\n    consumers: 1\n    processing_concurrency: -1\n", wantErr: "topics.events.processing_concurrency"},
+		{name: "zero topic batch timeout", contents: "kafka:\n  enabled: true\ntopics:\n  - name: events\n    consumers: 1\n    batch_timeout: 0s\n", wantErr: "topics.events.batch_timeout"},
+		{name: "negative topic batch timeout", contents: "kafka:\n  enabled: true\ntopics:\n  - name: events\n    consumers: 1\n    batch_timeout: -1s\n", wantErr: "topics.events.batch_timeout"},
+		{name: "zero topic commit timeout", contents: "kafka:\n  enabled: true\ntopics:\n  - name: events\n    consumers: 1\n    commit_timeout: 0s\n", wantErr: "topics.events.commit_timeout"},
+		{name: "negative topic commit timeout", contents: "kafka:\n  enabled: true\ntopics:\n  - name: events\n    consumers: 1\n    commit_timeout: -1s\n", wantErr: "topics.events.commit_timeout"},
 		{
 			name:     "invalid enabled flag rejected",
 			contents: "kafka:\n  enabled: not-a-bool\n",
@@ -137,8 +161,16 @@ func TestLoadConfig(t *testing.T) {
 
 func TestLoadConfigPublicEntryPoints(t *testing.T) {
 	configDir := t.TempDir()
-	configPath := filepath.Join(configDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte("topics:\n  - name: public-api\n    consumers: 1\n"), 0o600); err != nil {
+	configPath := filepath.Join(configDir, "explicit.yaml")
+	defaultConfigPath := filepath.Join(configDir, "configs", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(defaultConfigPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	contents := []byte("topics:\n  - name: public-api\n    consumers: 1\n")
+	if err := os.WriteFile(defaultConfigPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -152,7 +184,10 @@ func TestLoadConfigPublicEntryPoints(t *testing.T) {
 		}
 	})
 
-	t.Run("default config.yaml", func(t *testing.T) {
+	t.Run("configs/config.yaml selected over root config.yaml", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte("topics:\n  - name: root-file\n    consumers: 1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		t.Chdir(configDir)
 		cfg, err := LoadConfig("")
 		if err != nil {
@@ -163,13 +198,17 @@ func TestLoadConfigPublicEntryPoints(t *testing.T) {
 		}
 	})
 
-	t.Run("missing default config", func(t *testing.T) {
-		t.Chdir(t.TempDir())
+	t.Run("missing configs file ignores root config.yaml", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "config.yaml"), []byte("topics:\n  - name: root-file\n    consumers: 1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(root)
 		cfg, err := LoadConfig("")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.Kafka.Enabled || cfg.Kafka.FetchMaxBytes != DefaultConfig().Kafka.FetchMaxBytes {
+		if cfg.Kafka.Enabled || cfg.Kafka.FetchMaxBytes != DefaultConfig().Kafka.FetchMaxBytes || cfg.Topics[0].Name != "greetings" {
 			t.Fatalf("missing default config = %+v", cfg)
 		}
 	})
@@ -208,11 +247,11 @@ func TestConfigValidateKafkaNativeOptions(t *testing.T) {
 		{name: "session timeout below minimum", mutate: func(cfg *Config) { cfg.Kafka.SessionTimeoutMS = 99 }, want: "session.timeout.ms"},
 		{name: "session timeout over int32", mutate: func(cfg *Config) { cfg.Kafka.SessionTimeoutMS = 1<<31 - 1 + 1 }, want: "session.timeout.ms"},
 		{name: "unknown compression type", mutate: func(cfg *Config) { cfg.Kafka.CompressionType = "brotli" }, want: "compression.type"},
-		{name: "zero batch timeout", mutate: func(cfg *Config) { cfg.BatchTimeout = 0 }, want: "batch_timeout must be positive"},
-		{name: "zero commit timeout", mutate: func(cfg *Config) { cfg.CommitTimeout = 0 }, want: "commit_timeout must be positive"},
-		{name: "long batch and commit timeouts allowed", mutate: func(cfg *Config) {
-			cfg.BatchTimeout = 30 * 24 * time.Hour
-			cfg.CommitTimeout = 30 * 24 * time.Hour
+		{name: "zero topic batch timeout", mutate: func(cfg *Config) { cfg.Topics[0].BatchTimeout = 0 }, want: "topics.greetings.batch_timeout must be positive"},
+		{name: "zero topic commit timeout", mutate: func(cfg *Config) { cfg.Topics[0].CommitTimeout = 0 }, want: "topics.greetings.commit_timeout must be positive"},
+		{name: "long topic timeouts allowed", mutate: func(cfg *Config) {
+			cfg.Topics[0].BatchTimeout = 30 * 24 * time.Hour
+			cfg.Topics[0].CommitTimeout = 30 * 24 * time.Hour
 		}, want: ""},
 	}
 
@@ -244,7 +283,7 @@ func TestConfigValidateExistingRules(t *testing.T) {
 		{name: "bad broker address", mutate: func(cfg *Config) { cfg.Kafka.Brokers = []string{"broker"} }, want: "invalid host:port"},
 		{name: "bad broker port", mutate: func(cfg *Config) { cfg.Kafka.Brokers = []string{"broker:70000"} }, want: "invalid port"},
 		{name: "empty group", mutate: func(cfg *Config) { cfg.Kafka.GroupID = " " }, want: "group_id must not be empty"},
-		{name: "zero concurrency", mutate: func(cfg *Config) { cfg.ProcessingConcurrency = 0 }, want: "processing_concurrency must be positive"},
+		{name: "zero topic concurrency", mutate: func(cfg *Config) { cfg.Topics[0].ProcessingConcurrency = 0 }, want: "topics.greetings.processing_concurrency must be positive"},
 		{name: "no topics", mutate: func(cfg *Config) { cfg.Topics = nil }, want: "at least one topic"},
 		{name: "bad topic", mutate: func(cfg *Config) { cfg.Topics[0].Name = "bad topic" }, want: "invalid Kafka topic name"},
 		{name: "duplicate topic", mutate: func(cfg *Config) { cfg.Topics = append(cfg.Topics, cfg.Topics[0]) }, want: "duplicate topic"},

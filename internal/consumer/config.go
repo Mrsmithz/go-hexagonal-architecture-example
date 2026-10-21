@@ -3,8 +3,10 @@ package consumer
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -25,11 +27,8 @@ const (
 )
 
 type Config struct {
-	Kafka                 KafkaConfig   `koanf:"kafka"`
-	Topics                []TopicConfig `koanf:"topics"`
-	ProcessingConcurrency int           `koanf:"processing_concurrency"`
-	BatchTimeout          time.Duration `koanf:"batch_timeout"`
-	CommitTimeout         time.Duration `koanf:"commit_timeout"`
+	Kafka  KafkaConfig   `koanf:"kafka"`
+	Topics []TopicConfig `koanf:"topics"`
 }
 
 type KafkaConfig struct {
@@ -58,8 +57,11 @@ type TLSConfig struct {
 }
 
 type TopicConfig struct {
-	Name      string `koanf:"name"`
-	Consumers int    `koanf:"consumers"`
+	Name                  string        `koanf:"name"`
+	Consumers             int           `koanf:"consumers"`
+	ProcessingConcurrency int           `koanf:"processing_concurrency"`
+	BatchTimeout          time.Duration `koanf:"batch_timeout"`
+	CommitTimeout         time.Duration `koanf:"commit_timeout"`
 }
 
 func DefaultConfig() Config {
@@ -77,10 +79,13 @@ func DefaultConfig() Config {
 			SessionTimeoutMS:  45_000,
 			CompressionType:   "lz4",
 		},
-		Topics:                []TopicConfig{{Name: "greetings", Consumers: 1}},
-		ProcessingConcurrency: 10,
-		BatchTimeout:          30 * time.Second,
-		CommitTimeout:         10 * time.Second,
+		Topics: []TopicConfig{{
+			Name:                  "greetings",
+			Consumers:             1,
+			ProcessingConcurrency: 10,
+			BatchTimeout:          30 * time.Second,
+			CommitTimeout:         10 * time.Second,
+		}},
 	}
 }
 
@@ -91,7 +96,7 @@ func LoadConfig(path string) (Config, error) {
 func loadConfig(path string, lookupEnv func(string) (string, bool)) (Config, error) {
 	defaults := DefaultConfig()
 	if path == "" {
-		path = "config.yaml"
+		path = "configs/config.yaml"
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 			return defaults, nil
 		}
@@ -118,10 +123,13 @@ func loadConfig(path string, lookupEnv func(string) (string, bool)) (Config, err
 				"server_name": defaults.Kafka.TLS.ServerName,
 			},
 		},
-		"topics":                 []map[string]any{{"name": defaults.Topics[0].Name, "consumers": defaults.Topics[0].Consumers}},
-		"processing_concurrency": defaults.ProcessingConcurrency,
-		"batch_timeout":          defaults.BatchTimeout.String(),
-		"commit_timeout":         defaults.CommitTimeout.String(),
+		"topics": []map[string]any{{
+			"name":                   defaults.Topics[0].Name,
+			"consumers":              defaults.Topics[0].Consumers,
+			"processing_concurrency": defaults.Topics[0].ProcessingConcurrency,
+			"batch_timeout":          defaults.Topics[0].BatchTimeout.String(),
+			"commit_timeout":         defaults.Topics[0].CommitTimeout.String(),
+		}},
 	}
 	k := koanf.NewWithConf(koanf.Conf{Delim: "::"})
 	if err := k.Load(confmap.Provider(values, "::"), nil); err != nil {
@@ -145,7 +153,10 @@ func loadConfig(path string, lookupEnv func(string) (string, bool)) (Config, err
 
 	var cfg Config
 	decode := &mapstructure.DecoderConfig{
-		DecodeHook:  mapstructure.StringToTimeDurationHookFunc(),
+		DecodeHook: mapstructure.ComposeDecodeHookFunc(
+			mapstructure.StringToTimeDurationHookFunc(),
+			defaultTopicConfigDecodeHook,
+		),
 		ErrorUnused: true,
 	}
 	if err := k.UnmarshalWithConf("", &cfg, koanf.UnmarshalConf{Tag: "koanf", DecoderConfig: decode}); err != nil {
@@ -160,6 +171,27 @@ func loadConfig(path string, lookupEnv func(string) (string, bool)) (Config, err
 }
 
 var topicNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+func defaultTopicConfigDecodeHook(from, to reflect.Type, data any) (any, error) {
+	if to != reflect.TypeFor[TopicConfig]() || from.Kind() != reflect.Map {
+		return data, nil
+	}
+	values, ok := data.(map[string]any)
+	if !ok {
+		return data, nil
+	}
+	values = maps.Clone(values)
+	if _, ok := values["processing_concurrency"]; !ok {
+		values["processing_concurrency"] = 10
+	}
+	if _, ok := values["batch_timeout"]; !ok {
+		values["batch_timeout"] = "30s"
+	}
+	if _, ok := values["commit_timeout"]; !ok {
+		values["commit_timeout"] = "10s"
+	}
+	return values, nil
+}
 
 func (cfg Config) Validate() error {
 	if len(cfg.Kafka.Brokers) == 0 {
@@ -200,15 +232,6 @@ func (cfg Config) Validate() error {
 	default:
 		return fmt.Errorf("kafka.compression.type has unsupported value %q", cfg.Kafka.CompressionType)
 	}
-	if cfg.ProcessingConcurrency <= 0 {
-		return fmt.Errorf("processing_concurrency must be positive")
-	}
-	if cfg.BatchTimeout <= 0 {
-		return fmt.Errorf("batch_timeout must be positive")
-	}
-	if cfg.CommitTimeout <= 0 {
-		return fmt.Errorf("commit_timeout must be positive")
-	}
 	if len(cfg.Topics) == 0 {
 		return fmt.Errorf("topics must contain at least one topic")
 	}
@@ -223,6 +246,15 @@ func (cfg Config) Validate() error {
 		seenTopics[topic.Name] = struct{}{}
 		if topic.Consumers <= 0 {
 			return fmt.Errorf("topics.%s.consumers must be positive", topic.Name)
+		}
+		if topic.ProcessingConcurrency <= 0 {
+			return fmt.Errorf("topics.%s.processing_concurrency must be positive", topic.Name)
+		}
+		if topic.BatchTimeout <= 0 {
+			return fmt.Errorf("topics.%s.batch_timeout must be positive", topic.Name)
+		}
+		if topic.CommitTimeout <= 0 {
+			return fmt.Errorf("topics.%s.commit_timeout must be positive", topic.Name)
 		}
 		if len(cfg.Kafka.GroupID)+1+len(topic.Name) > 249 {
 			return fmt.Errorf("derived consumer group ID for topic %q exceeds 249 characters", topic.Name)

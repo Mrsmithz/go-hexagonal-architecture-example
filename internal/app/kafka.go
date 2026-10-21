@@ -4,13 +4,14 @@ import (
 	"context"
 
 	"example.com/go-backend-example/internal/adapter/kafka"
+	"example.com/go-backend-example/internal/adapter/metrics"
 	"example.com/go-backend-example/internal/consumer"
 	"go.uber.org/zap"
 )
 
 type kafkaRun func(context.Context) error
 
-func newKafkaRun(config Config, logger *zap.Logger) (kafkaRun, error) {
+func newKafkaRun(config Config, logger *zap.Logger, consumerMetrics *metrics.Consumer) (kafkaRun, error) {
 	cfg := config.Consumer
 	if !cfg.Kafka.Enabled {
 		return nil, nil
@@ -31,6 +32,6 @@ func newKafkaRun(config Config, logger *zap.Logger) (kafkaRun, error) {
 			)
 			return nil
 		}
-		return consumer.Run(ctx, cfg, handler, factory)
+		return consumer.Run(ctx, cfg, consumerMetrics.Wrap(handler), factory)
 	}, nil
 }

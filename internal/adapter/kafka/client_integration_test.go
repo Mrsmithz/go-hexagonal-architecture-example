@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 	kafkamodule "github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"example.com/go-backend-example/internal/adapter/metrics"
 	"example.com/go-backend-example/internal/consumer"
 )
 
@@ -35,7 +37,7 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		cfg := integrationConfig(brokers, topic, "integration-distribution-group")
 		cfg.Topics[0].Consumers = 2
 		cfg.Kafka.MaxPollRecords = 3
-		cfg.ProcessingConcurrency = 2
+		cfg.Topics[0].ProcessingConcurrency = 2
 		started, cancel := context.WithCancel(ctx)
 		t.Cleanup(cancel)
 		received := make(chan consumer.Message, recordsCount)
@@ -132,8 +134,8 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		}
 		cancel()
 		waitForRun(t, done)
-		if got := peak.Load(); got < 2 || got > int32(cfg.ProcessingConcurrency) {
-			t.Errorf("peak concurrent handlers = %d, want between 2 and %d", got, cfg.ProcessingConcurrency)
+		if got := peak.Load(); got < 2 || got > int32(cfg.Topics[0].ProcessingConcurrency) {
+			t.Errorf("peak concurrent handlers = %d, want between 2 and %d", got, cfg.Topics[0].ProcessingConcurrency)
 		}
 		clientsMu.Lock()
 		defer clientsMu.Unlock()
@@ -163,18 +165,19 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		produceRecords(t, ctx, brokers, topic, 5, 1)
 		cfg := integrationConfig(brokers, topic, "integration-replay-group")
 		cfg.Kafka.MaxPollRecords = 3
-		cfg.ProcessingConcurrency = 1
+		cfg.Topics[0].ProcessingConcurrency = 1
 		var finished, failedRunCommits atomic.Int32
 		firstFactory, err := NewClientFactory(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
+		consumerMetrics := metrics.New(cfg.Topics)
 		firstRun := make(chan error, 1)
 		go func() {
-			firstRun <- consumer.Run(ctx, cfg, func(context.Context, consumer.Message) error {
+			firstRun <- consumer.Run(ctx, cfg, consumerMetrics.Wrap(func(context.Context, consumer.Message) error {
 				finished.Add(1)
 				return fmt.Errorf("intentional failure")
-			}, func(config consumer.Config, topicConfig consumer.TopicConfig) (*observedClient, error) {
+			}), func(config consumer.Config, topicConfig consumer.TopicConfig) (*observedClient, error) {
 				client, err := firstFactory(config, topicConfig)
 				if err != nil {
 					return nil, err
@@ -199,6 +202,14 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		committedFailures := int(failedRunCommits.Load())
 		if committedFailures < 1 || committedFailures > cfg.Kafka.MaxPollRecords {
 			t.Fatalf("committed %d completed failures, want between 1 and %d", committedFailures, cfg.Kafka.MaxPollRecords)
+		}
+		scrape := httptest.NewRecorder()
+		consumerMetrics.Handler().ServeHTTP(scrape, httptest.NewRequest("GET", "/metrics", nil))
+		for _, prefix := range []string{"kafka_consumer_messages_processed_total", "kafka_consumer_message_processing_duration_seconds_count"} {
+			want := fmt.Sprintf(`%s{status="failed",topic="%s"} %d`, prefix, topic, committedFailures)
+			if scrape.Code != 200 || !strings.Contains(scrape.Body.String(), want) {
+				t.Fatalf("failure metrics missing %q in HTTP %d scrape:\n%s", want, scrape.Code, scrape.Body.String())
+			}
 		}
 
 		retryCtx, cancelRetry := context.WithCancel(ctx)
@@ -432,7 +443,7 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		createTopic(t, ctx, container, topic, 1)
 		produceRecords(t, ctx, brokers, topic, 1, 1)
 		cfg := integrationConfig(brokers, topic, "integration-close-group")
-		cfg.CommitTimeout = 250 * time.Millisecond
+		cfg.Topics[0].CommitTimeout = 250 * time.Millisecond
 		factory, err := NewClientFactory(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -556,7 +567,7 @@ func integrationConfig(brokers []string, topic, groupID string) consumer.Config 
 	cfg.Kafka.GroupID = groupID
 	cfg.Kafka.TLS.Enabled = false
 	cfg.Kafka.AllowInsecure = true
-	cfg.Topics = []consumer.TopicConfig{{Name: topic, Consumers: 1}}
+	cfg.Topics[0].Name = topic
 	return cfg
 }
 

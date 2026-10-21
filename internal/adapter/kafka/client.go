@@ -86,7 +86,7 @@ func newClient(cfg consumer.Config, topic consumer.TopicConfig, mechanism sasl.M
 	if err != nil {
 		return nil, fmt.Errorf("create Kafka client for topic %q: %w", topic.Name, err)
 	}
-	return &Client{client: client, closeTimeout: cfg.CommitTimeout}, nil
+	return &Client{client: client, closeTimeout: topic.CommitTimeout}, nil
 }
 
 func (c *Client) Poll(ctx context.Context, maxRecords int) ([]consumer.Message, error) {

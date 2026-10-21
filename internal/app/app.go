@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"example.com/go-backend-example/internal/adapter/httpapi"
+	"example.com/go-backend-example/internal/adapter/metrics"
 	"example.com/go-backend-example/internal/adapter/sqlite"
 	"example.com/go-backend-example/internal/consumer"
 	"example.com/go-backend-example/internal/greeting"
@@ -59,9 +60,14 @@ func New(config Config, logger *zap.Logger, extra ...fx.Option) *fx.App {
 		fx.Provide(func(config Config) *sqlite.Store { return sqlite.New(config.SQLiteDSN) }),
 		fx.Provide(func(store *sqlite.Store) greeting.Store { return store }),
 		fx.Provide(greeting.NewService),
+		fx.Provide(func(config Config) *metrics.Consumer { return metrics.New(config.Consumer.Topics) }),
 		fx.Provide(newKafkaRun),
 		fx.Provide(func(service *greeting.Service) httpapi.Service { return service }),
-		fx.Provide(httpapi.New),
+		fx.Provide(func(service httpapi.Service, logger *zap.Logger, consumerMetrics *metrics.Consumer) *echo.Echo {
+			handler := httpapi.New(service, logger)
+			handler.GET("/metrics", echo.WrapHandler(consumerMetrics.Handler()))
+			return handler
+		}),
 		fx.Provide(func(config Config, handler *echo.Echo, logger *zap.Logger) *server.HTTP {
 			return server.New(config.HTTPAddress, handler, logger)
 		}),

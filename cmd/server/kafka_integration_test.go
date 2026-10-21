@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/exec"
 	kafkamodule "github.com/testcontainers/testcontainers-go/modules/kafka"
@@ -66,7 +68,7 @@ func TestServerRunsKafkaAlongsideHTTP(t *testing.T) {
 		}
 	}
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	yaml := fmt.Sprintf("kafka:\n  enabled: true\n  brokers: [%q]\n  group_id: fx-server\n  max.poll.records: 2\n  allow_insecure: true\n  tls:\n    enabled: false\ntopics:\n  - name: %s\n    consumers: 2\nprocessing_concurrency: 2\n", brokers[0], topic)
+	yaml := fmt.Sprintf("kafka:\n  enabled: true\n  brokers: [%q]\n  group_id: fx-server\n  max.poll.records: 2\n  allow_insecure: true\n  tls:\n    enabled: false\ntopics:\n  - name: %s\n    consumers: 2\n    processing_concurrency: 2\n", brokers[0], topic)
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -155,6 +157,47 @@ func TestServerRunsKafkaAlongsideHTTP(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("HTTP alongside Kafka = %d", response.StatusCode)
+	}
+	metricsResponse, err := client.Get("http://" + address + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer metricsResponse.Body.Close()
+	if metricsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics = %d", metricsResponse.StatusCode)
+	}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(metricsResponse.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(families) != 2 {
+		t.Fatalf("metric families = %d, want two", len(families))
+	}
+	for _, name := range []string{"kafka_consumer_messages_processed_total", "kafka_consumer_message_processing_duration_seconds"} {
+		family := families[name]
+		if len(family.GetMetric()) != 2 {
+			t.Fatalf("%s series = %d, want success and failed", name, len(family.GetMetric()))
+		}
+		for _, metric := range family.GetMetric() {
+			labels := make(map[string]string)
+			for _, label := range metric.Label {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if len(labels) != 2 || labels["topic"] != topic || (labels["status"] != "success" && labels["status"] != "failed") {
+				t.Fatalf("metric labels = %v", labels)
+			}
+			want := float64(0)
+			if labels["status"] == "success" {
+				want = 6
+			}
+			if name == "kafka_consumer_messages_processed_total" && metric.GetCounter().GetValue() != want {
+				t.Fatalf("counter %v = %v, want %v", labels, metric.GetCounter().GetValue(), want)
+			}
+			if name == "kafka_consumer_message_processing_duration_seconds" && metric.GetHistogram().GetSampleCount() != uint64(want) {
+				t.Fatalf("histogram count %v = %v, want %v", labels, metric.GetHistogram().GetSampleCount(), want)
+			}
+		}
 	}
 	for _, entry := range logs.FilterMessage("kafka message processed").All() {
 		fields := entry.ContextMap()

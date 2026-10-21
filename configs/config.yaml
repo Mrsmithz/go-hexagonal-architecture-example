@@ -19,6 +19,6 @@ kafka:
 topics:
   - name: greetings
     consumers: 1
-processing_concurrency: 10
-batch_timeout: 30s
-commit_timeout: 10s
+    processing_concurrency: 10
+    batch_timeout: 30s
+    commit_timeout: 10s

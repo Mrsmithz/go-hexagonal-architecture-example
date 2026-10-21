@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"example.com/go-backend-example/internal/adapter/metrics"
 	"example.com/go-backend-example/internal/consumer"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -21,7 +22,7 @@ func TestNewKafkaRunDisabledSkipsValidationAndSetup(t *testing.T) {
 		{},
 		{Kafka: consumer.KafkaConfig{Auth: consumer.AuthAWSIAM, Username: "invalid", Password: "invalid"}},
 	} {
-		run, err := newKafkaRun(Config{Consumer: cfg}, zap.NewNop())
+		run, err := newKafkaRun(Config{Consumer: cfg}, zap.NewNop(), metrics.New(cfg.Topics))
 		if err != nil || run != nil {
 			t.Fatalf("disabled Kafka runner is nil = %t, error = %v", run == nil, err)
 		}
@@ -32,7 +33,7 @@ func TestNewKafkaRunRejectsEnabledInvalidConfig(t *testing.T) {
 	cfg := consumer.DefaultConfig()
 	cfg.Kafka.Enabled = true
 	cfg.Kafka.GroupID = ""
-	if run, err := newKafkaRun(Config{Consumer: cfg}, zap.NewNop()); err == nil || run != nil {
+	if run, err := newKafkaRun(Config{Consumer: cfg}, zap.NewNop(), metrics.New(cfg.Topics)); err == nil || run != nil {
 		t.Fatalf("invalid Kafka runner is nil = %t, error = %v", run == nil, err)
 	}
 	application := New(Config{Consumer: cfg}, zap.NewNop())
@@ -53,7 +54,7 @@ func TestNewKafkaRunDefersAWSSetupUntilExecution(t *testing.T) {
 	cfg := consumer.DefaultConfig()
 	cfg.Kafka.Enabled = true
 	cfg.Kafka.Auth = consumer.AuthAWSIAM
-	run, err := newKafkaRun(Config{Consumer: cfg}, zap.NewNop())
+	run, err := newKafkaRun(Config{Consumer: cfg}, zap.NewNop(), metrics.New(cfg.Topics))
 	if err != nil || run == nil {
 		t.Fatalf("Kafka constructor performed AWS setup: %v", err)
 	}

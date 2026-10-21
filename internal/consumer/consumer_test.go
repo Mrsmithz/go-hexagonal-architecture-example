@@ -134,7 +134,7 @@ func TestRunCommitsWholeBatchAfterUnorderedHandlersSucceed(t *testing.T) {
 func TestRunUsesOneConcurrencyLimitAcrossClients(t *testing.T) {
 	cfg := testConfig()
 	cfg.Topics[0].Consumers = 2
-	cfg.ProcessingConcurrency = 2
+	cfg.Topics[0].ProcessingConcurrency = 2
 	gate := make(chan struct{})
 	started := make(chan struct{}, 4)
 	var active atomic.Int32
@@ -207,7 +207,7 @@ func TestRunUsesOneConcurrencyLimitAcrossClients(t *testing.T) {
 
 func TestRunCommitsFailedBatchAfterEveryHandlerCompletes(t *testing.T) {
 	cfg := testConfig()
-	cfg.ProcessingConcurrency = 1
+	cfg.Topics[0].ProcessingConcurrency = 1
 	batch := testMessages(4)
 	firstFailure := errors.New("first handler failed")
 	secondFailure := errors.New("second handler failed")
@@ -345,9 +345,9 @@ func TestRunDeadlinesLeaveUnfinishedBatchesUncommitted(t *testing.T) {
 		t.Run(deadline, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				cfg := testConfig()
-				cfg.ProcessingConcurrency = 1
+				cfg.Topics[0].ProcessingConcurrency = 1
 				if deadline == "batch" {
-					cfg.BatchTimeout = 20 * time.Millisecond
+					cfg.Topics[0].BatchTimeout = 20 * time.Millisecond
 				} else {
 					cfg.Kafka.MaxPollIntervalMS = 100
 				}
@@ -376,7 +376,7 @@ func TestRunPollIntervalAlsoBoundsCommit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := testConfig()
 		cfg.Kafka.MaxPollIntervalMS = 100
-		cfg.CommitTimeout = time.Second
+		cfg.Topics[0].CommitTimeout = time.Second
 		start := time.Now()
 		client := &testClient{
 			poll:   func(context.Context, int) ([]Message, error) { return testMessages(1), nil },
@@ -394,7 +394,7 @@ func TestRunPollIntervalAlsoBoundsCommit(t *testing.T) {
 
 func TestRunCancellationLeavesBatchUncommitted(t *testing.T) {
 	cfg := testConfig()
-	cfg.ProcessingConcurrency = 1
+	cfg.Topics[0].ProcessingConcurrency = 1
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})
 	var commits atomic.Int32

@@ -1,16 +1,16 @@
 # Kafka consumer
 
-The Fx server runs HTTP and an optional Kafka worker in the same process. Set `kafka.enabled: true` in `config.yaml`, then run:
+The Fx server runs HTTP and an optional Kafka worker in the same process. Set `kafka.enabled: true` in `configs/config.yaml`, then run:
 
 ```sh
 go run ./cmd/server
 ```
 
-Kafka is disabled by default. The server loads `config.yaml` when present. Set `CONFIG_FILE` to require another file. A missing default file leaves HTTP running without Kafka; a missing explicit file fails startup. Disabled Kafka does not initialize authentication, create clients, or contact brokers. The sample handler logs only topic, partition, and offset. It does not mutate greetings or call the HTTP application's storage.
+Kafka is disabled by default. The server loads `configs/config.yaml` when present. Set `CONFIG_FILE` to require another file. A missing default file leaves HTTP running without Kafka; a missing explicit file fails startup. Disabled Kafka does not initialize authentication, create clients, or contact brokers. The sample handler logs only topic, partition, and offset. It does not mutate greetings or call the HTTP application's storage.
 
 ## Configuration
 
-`config.yaml` in the repository is a local plaintext example for Kafka at `127.0.0.1:29092`. It explicitly sets `kafka.allow_insecure: true` because TLS is disabled. For normal deployments, leave TLS enabled and keep `allow_insecure: false`.
+`configs/config.yaml` in the repository is a local plaintext example for Kafka at `127.0.0.1:29092`. It explicitly sets `kafka.allow_insecure: true` because TLS is disabled. For normal deployments, leave TLS enabled and keep `allow_insecure: false`.
 
 | Key | Meaning |
 | --- | --- |
@@ -32,11 +32,11 @@ Kafka is disabled by default. The server loads `config.yaml` when present. Set `
 | `kafka.allow_insecure` | Explicit opt-in for local plaintext testing only. IAM always requires TLS. |
 | `topics[].name` | Kafka topic to consume. Duplicate or invalid Kafka topic names are rejected. |
 | `topics[].consumers` | Number of consumer-group clients for this topic. |
-| `processing_concurrency` | Shared maximum number of concurrently executing handlers across all topics and clients. |
-| `batch_timeout` | Deadline for completing a polled batch, including time waiting for the shared concurrency limit. |
-| `commit_timeout` | Deadline for each synchronous offset commit and for leaving the group during shutdown. |
+| `topics[].processing_concurrency` | Maximum concurrently executing handlers shared by this topic's clients. Defaults to `10`; must be positive. |
+| `topics[].batch_timeout` | Deadline for completing a polled batch, including waiting for this topic's concurrency limit. Defaults to `30s`; must be positive. |
+| `topics[].commit_timeout` | Deadline for this topic's synchronous offset commits and group leave during shutdown. Defaults to `10s`; must be positive. |
 
-Each configured client is a member of its topic's derived group. More clients than the topic has partitions remain idle. `kafka.max.poll.records` bounds records held for processing by each client; handler concurrency is separately bounded process-wide by `processing_concurrency`. Migrate existing `batch_size` settings to `kafka.max.poll.records`; the old key is rejected rather than silently ignored. The dotted option names are literal YAML keys under `kafka`, as shown below. Millisecond settings accept integers from `100` through `2147483647`.
+Each configured client is a member of its topic's derived group. More clients than the topic has partitions remain idle. `kafka.max.poll.records` bounds records held for processing by each client; handler concurrency is separately bounded per topic by `topics[].processing_concurrency`. Clients of one topic share its limit; other topics have independent limits, so total process concurrency can reach the sum of the topic limits. Move the former root-level `processing_concurrency`, `batch_timeout`, and `commit_timeout` settings into each topic entry; the old global keys are rejected. Omitted per-topic settings receive defaults, while explicit zero or negative values are rejected when Kafka is enabled. Migrate existing `batch_size` settings to `kafka.max.poll.records`; the old key is rejected rather than silently ignored. The dotted option names are literal YAML keys under `kafka`, as shown below. Millisecond settings accept integers from `100` through `2147483647`.
 
 Fetch byte limits do not bound total process memory. Multiple brokers can fetch concurrently, and decompressed records can occupy more memory than compressed data. Compression is chosen by the producer or topic, not by this consumer. The client automatically decodes supported incoming codecs. Its LZ4 producer default matters only when that underlying client produces records.
 
@@ -65,9 +65,14 @@ kafka:
 topics:
   - name: greetings
     consumers: 2
-processing_concurrency: 8
-batch_timeout: 30s
-commit_timeout: 10s
+    processing_concurrency: 8
+    batch_timeout: 30s
+    commit_timeout: 10s
+  - name: audit-events
+    consumers: 1
+    processing_concurrency: 2
+    batch_timeout: 15s
+    commit_timeout: 5s
 ```
 
 ```sh
@@ -86,11 +91,32 @@ Offset commits are manual. Automatic commits remain disabled. The worker process
 
 Cancellation, batch deadline expiry, or poll-interval expiry before processing finishes leaves the batch uncommitted, including records still waiting for a concurrency slot. The worker never commits a higher offset from an incomplete concurrent batch because that could skip an unattempted lower offset. Poll and commit errors remain fatal. When both handling and committing fail, both errors are reported. Commit failures can leave some partition offsets committed, and a timeout can leave the result uncertain. Cross-partition batch commits are not atomic. Crashes and uncommitted or uncertain results can replay handling attempts, so handlers should remain idempotent. Acknowledgment confirms a completed handling attempt, not successful business processing.
 
-`batch_timeout` bounds processing, including waiting for concurrency slots. `commit_timeout` bounds each synchronous commit. `kafka.max.poll.interval.ms` caps their combined elapsed time from a nonempty poll result to commit completion. Each deadline is cooperative; handlers must honor their context. Idle time spent polling an empty topic does not expire this processing budget. franz-go has no Java-style `MaxPollInterval` option, so the application enforces the interval and also supplies it as `kgo.RebalanceTimeout` while blocking rebalances during a batch. `session.timeout.ms` maps separately to `kgo.SessionTimeout`; the heartbeat interval is the smaller of 3 seconds and one-third of that session timeout. Configure broker limits to allow the selected timeouts.
+Each topic's `batch_timeout` bounds processing, including waiting for its concurrency slots. Its `commit_timeout` bounds each synchronous commit. `kafka.max.poll.interval.ms` caps their combined elapsed time from a nonempty poll result to commit completion. Each deadline is cooperative; handlers must honor their context. Idle time spent polling an empty topic does not expire this processing budget. franz-go has no Java-style `MaxPollInterval` option, so the application enforces the interval and also supplies it as `kgo.RebalanceTimeout` while blocking rebalances during a batch. `session.timeout.ms` maps separately to `kgo.SessionTimeout`; the heartbeat interval is the smaller of 3 seconds and one-third of that session timeout. Configure broker limits to allow the selected timeouts.
 
 Fx launches Kafka after SQLite and HTTP start. Startup means the runner has launched, not that a broker is reachable. Authentication, client setup, poll, handler, and commit failures request Fx shutdown with a nonzero exit code, stopping the HTTP server too.
 
-On SIGINT or SIGTERM, Fx cancels Kafka, drains HTTP, and joins Kafka before closing SQLite and flushing logs. Kafka stops polling, cancels handler contexts, leaves incomplete batches uncommitted, waits for cooperative handlers, and then closes clients concurrently while allowing rebalances. Each client waits up to `commit_timeout` to leave its group before forcing local shutdown; unreachable brokers cannot multiply that wait by the client count. A forced leave can keep partitions assigned until Kafka's session timeout expires. Handlers must honor their context and should not start detached work that outlives it. A handler that ignores cancellation can prevent clean shutdown. Joining Kafka and releasing resources can exceed Fx's stop deadline; the deadline is not a hard process-exit limit.
+On SIGINT or SIGTERM, Fx cancels Kafka, drains HTTP, and joins Kafka before closing SQLite and flushing logs. Kafka stops polling, cancels handler contexts, leaves incomplete batches uncommitted, waits for cooperative handlers, and then closes clients concurrently while allowing rebalances. Each client waits up to its topic's `commit_timeout` to leave its group before forcing local shutdown; unreachable brokers cannot multiply that wait by the client count. A forced leave can keep partitions assigned until Kafka's session timeout expires. Handlers must honor their context and should not start detached work that outlives it. A handler that ignores cancellation can prevent clean shutdown. Joining Kafka and releasing resources can exceed Fx's stop deadline; the deadline is not a hard process-exit limit.
+
+## Metrics
+
+Scrape `GET /metrics` on the existing HTTP listener, for example `http://localhost:8080/metrics`. Each Fx application has an isolated Prometheus registry with exactly two metric families. No Go, process, or HTTP metric collectors are registered.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `kafka_consumer_messages_processed_total` | Counter | Completed handler invocations by `topic` and `status`. |
+| `kafka_consumer_message_processing_duration_seconds` | Histogram | Elapsed handler time in seconds by `topic` and `status`. |
+
+`status="success"` means the handler returned `nil`; `status="failed"` means it returned an error, including a cancellation error. Timing starts when the handler is invoked and ends when it returns. It excludes time waiting for a concurrency slot and time committing offsets. Messages that never reach the handler do not create observations. A panic is not recovered or counted as a returned failure.
+
+These metrics describe processing attempts, not committed offsets. Replayed messages create new observations, and a completed attempt can be counted even if its batch is later left uncommitted. Each configured topic starts with zero-valued `success` and `failed` series. Kafka may remain disabled while `/metrics` is available. Counters reset when the process restarts. No message ID, offset, partition, or error-text labels are used.
+
+A histogram records each message's duration without creating a separate time series for each message. Prometheus exposes its `_bucket`, `_sum`, and `_count` series. These are parts of the second metric family, not additional application metric families. For average handler duration by topic and status, query:
+
+```promql
+rate(kafka_consumer_message_processing_duration_seconds_sum[5m])
+/
+rate(kafka_consumer_message_processing_duration_seconds_count[5m])
+```
 
 ## Tests
 
@@ -100,4 +126,4 @@ make test-integration
 make check
 ```
 
-`make test-integration` and `make check` run the real Kafka integration suite through the rootless Podman API socket selected by `scripts/test-integration-podman.sh`; no Docker daemon fallback or test skip is used. The Kafka integration brokers use `docker.io/confluentinc/cp-kafka:8.0.0`. Tests cover HTTP and enabled Kafka in the same server, lifecycle failure propagation and cleanup, batch bounds, shared concurrency, consumer-group partition distribution, completed-failure commits without replay, successful-offset restart, latest-offset reset, LZ4 production/decompression, cancellation, coordinator-outage shutdown, and real SASL/PLAIN authentication with both valid and invalid passwords. The suite terminates only the containers it creates. The integration coverage remains part of the repository's 90% overall coverage gate.
+`make test-integration` and `make check` run the real Kafka integration suite through the rootless Podman API socket selected by `scripts/test-integration-podman.sh`; no Docker daemon fallback or test skip is used. The Kafka integration brokers use `docker.io/confluentinc/cp-kafka:8.0.0`. Tests cover HTTP and enabled Kafka in the same server, live `/metrics` scrapes, successful and failed processing observations, lifecycle failure propagation and cleanup, batch bounds, shared per-topic concurrency and independent topic limits, per-topic deadlines, consumer-group partition distribution, completed-failure commits without replay, successful-offset restart, latest-offset reset, LZ4 production/decompression, cancellation, coordinator-outage shutdown, and real SASL/PLAIN authentication with both valid and invalid passwords. The suite terminates only the containers it creates. The integration coverage remains part of the repository's 90% overall coverage gate.

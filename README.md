@@ -1,6 +1,6 @@
 # Go backend example
 
-A small Echo HTTP service with a greeting feature, a storage port, and a SQLite adapter. Uber Fx composes the adapters and coordinates their lifecycle. Zap provides structured JSON logs. The feature core remains independent of Fx, Echo, Zap, and GORM. The same server can run a configurable franz-go Kafka consumer under Fx. Set `kafka.enabled: true` in `config.yaml` to enable it. Kafka is disabled by default.
+A small Echo HTTP service with a greeting feature, a storage port, and a SQLite adapter. Uber Fx composes the adapters and coordinates their lifecycle. Zap provides structured JSON logs. The feature core remains independent of Fx, Echo, Zap, and GORM. The same server can run a configurable franz-go Kafka consumer under Fx. Set `kafka.enabled: true` in `configs/config.yaml` to enable it. Kafka is disabled by default.
 
 Use Go 1.27.3. The module pins Echo v5.4.0, Fx v1.24.0, Zap v1.28.0 and current compatible dependencies in `go.mod` and `go.sum`. These stable versions were checked against the [Go releases](https://go.dev/dl/) and [Go module proxy](https://proxy.golang.org/github.com/labstack/echo/v5/@latest) during implementation.
 
@@ -16,12 +16,15 @@ The SQLite driver uses CGO. Install a C compiler such as GCC before building or 
 
 ```sh
 curl -i http://localhost:8080/hello
+curl http://localhost:8080/metrics
 curl -i -H 'Content-Type: application/json' -d '{"message":"Hello there"}' http://localhost:8080/api/v1/greetings
 curl -i http://localhost:8080/api/v1/greetings/1
 curl -i http://localhost:8080/api/v1/greetings
 curl -i -X PUT -H 'Content-Type: application/json' -d '{"message":"Updated"}' http://localhost:8080/api/v1/greetings/1
 curl -i -X DELETE http://localhost:8080/api/v1/greetings/1
 ```
+
+`GET /metrics` exposes two Kafka processing metric families, a completed-message counter and a processing-duration histogram in seconds. Both use `topic` and `status` (`success` or `failed`) labels. See the [Kafka metrics section](docs/kafka-consumer.md#metrics) for their names and semantics.
 
 Run unit tests with `go test ./...`. Run real-listener and Kafka integration tests with `make test-integration`, which uses rootless Podman. See [API](docs/api.md), [architecture](docs/architecture.md), and the [Kafka consumer guide](docs/kafka-consumer.md).
 
