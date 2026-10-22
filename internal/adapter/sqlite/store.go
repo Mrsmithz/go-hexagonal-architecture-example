@@ -65,8 +65,8 @@ func (s *Store) Start(ctx context.Context) (startErr error) {
 			return fmt.Errorf("enable sqlite WAL: %w", err)
 		}
 	}
-	if err := db.WithContext(ctx).AutoMigrate(&greetingRow{}); err != nil {
-		return fmt.Errorf("migrate greetings schema: %w", err)
+	if err := db.WithContext(ctx).AutoMigrate(&greetingRow{}, &eventRow{}); err != nil {
+		return fmt.Errorf("migrate sqlite schema: %w", err)
 	}
 	s.db, s.sqlDB = db, sqlDB
 	return nil

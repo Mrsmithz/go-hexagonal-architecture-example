@@ -205,25 +205,34 @@ func TestRunUsesOneConcurrencyLimitAcrossClients(t *testing.T) {
 	}
 }
 
-func TestRunCommitsFailedBatchAfterEveryHandlerCompletes(t *testing.T) {
+func TestRunCommitsBatchAfterHandlerFailuresAreDeadLettered(t *testing.T) {
 	cfg := testConfig()
 	cfg.Topics[0].ProcessingConcurrency = 1
 	batch := testMessages(4)
 	firstFailure := errors.New("first handler failed")
 	secondFailure := errors.New("second handler failed")
-	var finished atomic.Int32
-	var commits atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var finished, deadLetters, commits atomic.Int32
 	consumerClient := &testClient{
 		poll: func(context.Context, int) ([]Message, error) { return batch, nil },
 		commit: func(_ context.Context, messages ...Message) error {
-			if finished.Load() != int32(len(batch)) || len(messages) != len(batch) {
-				return fmt.Errorf("commit before all four handling attempts completed")
+			if finished.Load() != int32(len(batch)) || deadLetters.Load() != 2 || len(messages) != len(batch) {
+				return fmt.Errorf("commit before all handler and dead-letter attempts completed")
 			}
 			commits.Add(1)
+			cancel()
+			return nil
+		},
+		onDLQ: func(_ context.Context, record Message, handlerErr error) error {
+			deadLetters.Add(1)
+			if record.Offset == 0 && !errors.Is(handlerErr, firstFailure) || record.Offset == 2 && !errors.Is(handlerErr, secondFailure) {
+				return fmt.Errorf("dead-letter received wrong failure for offset %d", record.Offset)
+			}
 			return nil
 		},
 	}
-	err := Run(t.Context(), cfg, func(ctx context.Context, message Message) error {
+	err := Run(ctx, cfg, func(ctx context.Context, message Message) error {
 		if ctx.Err() != nil {
 			return fmt.Errorf("ordinary handler failure canceled a sibling: %w", ctx.Err())
 		}
@@ -237,20 +246,64 @@ func TestRunCommitsFailedBatchAfterEveryHandlerCompletes(t *testing.T) {
 			return nil
 		}
 	}, func(Config, TopicConfig) (*testClient, error) { return consumerClient, nil })
-	if !errors.Is(err, firstFailure) || !errors.Is(err, secondFailure) {
-		t.Fatalf("Run() error = %v, want both handler failures", err)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil after cancellation", err)
 	}
-	if got := commits.Load(); got != 1 {
-		t.Errorf("committed %d completed failed batches, want 1", got)
+	if commits.Load() != 1 || finished.Load() != int32(len(batch)) {
+		t.Fatalf("commits=%d handlers=%d, want one commit after all handlers", commits.Load(), finished.Load())
 	}
-	if got := finished.Load(); got != int32(len(batch)) {
-		t.Errorf("finished %d handling attempts, want %d", got, len(batch))
+}
+
+func TestRunDeadLetterPublicationHoldsTopicConcurrencySlot(t *testing.T) {
+	cfg := testConfig()
+	cfg.Topics[0].ProcessingConcurrency = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	firstPublishStarted := make(chan struct{})
+	releasePublish := make(chan struct{})
+	var handled, published atomic.Int32
+	client := &testClient{
+		poll: func(ctx context.Context, _ int) ([]Message, error) {
+			if handled.Load() == 0 {
+				return testMessages(2), nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		commit: func(context.Context, ...Message) error { cancel(); return nil },
+		onDLQ: func(ctx context.Context, _ Message, _ error) error {
+			if published.Add(1) == 1 {
+				close(firstPublishStarted)
+				select {
+				case <-releasePublish:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		},
 	}
-	if got := consumerClient.allowCount.Load(); got != 1 {
-		t.Errorf("AllowRebalance() called %d times, want 1", got)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, cfg, func(context.Context, Message) error {
+			handled.Add(1)
+			return errors.New("handler failed")
+		}, func(Config, TopicConfig) (*testClient, error) { return client, nil })
+	}()
+	select {
+	case <-firstPublishStarted:
+	case <-time.After(time.Second):
+		t.Fatal("dead-letter publication did not start")
 	}
-	if got := consumerClient.closeCount.Load(); got != 1 {
-		t.Errorf("CloseAllowingRebalance() called %d times, want 1", got)
+	if got := handled.Load(); got != 1 {
+		t.Fatalf("handlers started while dead-letter held concurrency slot: %d, want 1", got)
+	}
+	close(releasePublish)
+	if err := <-done; err != nil {
+		t.Fatalf("Run() error = %v, want nil after resolved batch cancellation", err)
+	}
+	if handled.Load() != 2 || published.Load() != 2 {
+		t.Fatalf("handlers=%d dead-letter publications=%d, want 2 each", handled.Load(), published.Load())
 	}
 }
 
@@ -325,18 +378,32 @@ func TestRunCommitFailureReturnsError(t *testing.T) {
 	}
 }
 
-func TestRunReportsHandlerAndCommitFailures(t *testing.T) {
-	cfg := testConfig()
+func TestRunDoesNotCommitWhenDeadLetterPublicationFails(t *testing.T) {
 	handlerFailure := errors.New("handler failed")
-	commitFailure := errors.New("commit failed")
+	publishFailure := errors.New("dead-letter publish failed")
+	var polls, handlers, commits atomic.Int32
 	client := &testClient{
-		poll:   func(context.Context, int) ([]Message, error) { return testMessages(1), nil },
-		commit: func(context.Context, ...Message) error { return commitFailure },
+		poll: func(context.Context, int) ([]Message, error) {
+			polls.Add(1)
+			return testMessages(3), nil
+		},
+		commit: func(context.Context, ...Message) error { commits.Add(1); return nil },
+		onDLQ: func(_ context.Context, message Message, _ error) error {
+			if message.Offset == 0 {
+				return publishFailure
+			}
+			return nil
+		},
 	}
-	err := Run(t.Context(), cfg, func(context.Context, Message) error { return handlerFailure },
-		func(Config, TopicConfig) (*testClient, error) { return client, nil })
-	if !errors.Is(err, handlerFailure) || !errors.Is(err, commitFailure) {
-		t.Fatalf("Run() error = %v, want both handler and commit failures", err)
+	err := Run(t.Context(), testConfig(), func(context.Context, Message) error {
+		handlers.Add(1)
+		return handlerFailure
+	}, func(Config, TopicConfig) (*testClient, error) { return client, nil })
+	if !errors.Is(err, handlerFailure) || !errors.Is(err, publishFailure) {
+		t.Fatalf("Run() error = %v, want handler and publish failures", err)
+	}
+	if handlers.Load() != 3 || polls.Load() != 1 || commits.Load() != 0 {
+		t.Fatalf("handlers=%d polls=%d commits=%d, want 3, 1, 0", handlers.Load(), polls.Load(), commits.Load())
 	}
 }
 
@@ -476,6 +543,7 @@ func waitSignals(t *testing.T, signals <-chan struct{}, count int) {
 type testClient struct {
 	poll       func(context.Context, int) ([]Message, error)
 	commit     func(context.Context, ...Message) error
+	onDLQ      func(context.Context, Message, error) error
 	allowCount atomic.Int32
 	closeCount atomic.Int32
 }
@@ -493,6 +561,13 @@ func (c *testClient) Commit(ctx context.Context, records ...Message) error {
 		return nil
 	}
 	return c.commit(ctx, records...)
+}
+
+func (c *testClient) PublishDeadLetter(ctx context.Context, message Message, handlerErr error) error {
+	if c.onDLQ == nil {
+		return nil
+	}
+	return c.onDLQ(ctx, message, handlerErr)
 }
 
 func (c *testClient) AllowRebalance() {

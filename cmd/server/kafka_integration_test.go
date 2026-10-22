@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"net"
@@ -62,7 +63,7 @@ func TestServerRunsKafkaAlongsideHTTP(t *testing.T) {
 	}
 	defer producer.Close()
 	for index := range 6 {
-		record := &kgo.Record{Topic: topic, Partition: int32(index % 2), Value: []byte("not logged")}
+		record := &kgo.Record{Topic: topic, Partition: int32(index % 2), Value: fmt.Appendf(nil, `{"user_id":%d,"event":"login","timestamp":1729526400}`, 101+index)}
 		if err := producer.ProduceSync(ctx, record).FirstErr(); err != nil {
 			t.Fatal(err)
 		}
@@ -149,6 +150,15 @@ func TestServerRunsKafkaAlongsideHTTP(t *testing.T) {
 		if code == 0 && committed == 2 {
 			break
 		}
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(filepath.Dir(path), "server.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var persisted int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM user_events WHERE event = 'login' AND timestamp = 1729526400").Scan(&persisted); err != nil || persisted != 6 {
+		t.Fatalf("persisted events = %d, error = %v", persisted, err)
 	}
 	response, err := client.Get("http://" + address + "/hello")
 	if err != nil {

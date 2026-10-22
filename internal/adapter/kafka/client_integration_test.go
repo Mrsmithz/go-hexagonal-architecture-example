@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +18,6 @@ import (
 	kafkamodule "github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"example.com/go-backend-example/internal/adapter/metrics"
 	"example.com/go-backend-example/internal/consumer"
 )
 
@@ -159,101 +157,12 @@ func TestKafkaConsumerIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("completed failures are committed and do not replay", func(t *testing.T) {
-		topic := "integration-replay"
-		createTopic(t, ctx, container, topic, 1)
-		produceRecords(t, ctx, brokers, topic, 5, 1)
-		cfg := integrationConfig(brokers, topic, "integration-replay-group")
-		cfg.Kafka.MaxPollRecords = 3
-		cfg.Topics[0].ProcessingConcurrency = 1
-		var finished, failedRunCommits atomic.Int32
-		firstFactory, err := NewClientFactory(ctx, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		consumerMetrics := metrics.New(cfg.Topics)
-		firstRun := make(chan error, 1)
-		go func() {
-			firstRun <- consumer.Run(ctx, cfg, consumerMetrics.Wrap(func(context.Context, consumer.Message) error {
-				finished.Add(1)
-				return fmt.Errorf("intentional failure")
-			}), func(config consumer.Config, topicConfig consumer.TopicConfig) (*observedClient, error) {
-				client, err := firstFactory(config, topicConfig)
-				if err != nil {
-					return nil, err
-				}
-				return &observedClient{Client: client, onCommit: func(messages []consumer.Message) error {
-					if finished.Load() != int32(len(messages)) {
-						return fmt.Errorf("committed before every handling attempt finished")
-					}
-					failedRunCommits.Add(int32(len(messages)))
-					return nil
-				}}, nil
-			})
-		}()
-		select {
-		case err := <-firstRun:
-			if err == nil {
-				t.Fatal("first run error = nil, want handler failure after commit")
-			}
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
-		}
-		committedFailures := int(failedRunCommits.Load())
-		if committedFailures < 1 || committedFailures > cfg.Kafka.MaxPollRecords {
-			t.Fatalf("committed %d completed failures, want between 1 and %d", committedFailures, cfg.Kafka.MaxPollRecords)
-		}
-		scrape := httptest.NewRecorder()
-		consumerMetrics.Handler().ServeHTTP(scrape, httptest.NewRequest("GET", "/metrics", nil))
-		for _, prefix := range []string{"kafka_consumer_messages_processed_total", "kafka_consumer_message_processing_duration_seconds_count"} {
-			want := fmt.Sprintf(`%s{status="failed",topic="%s"} %d`, prefix, topic, committedFailures)
-			if scrape.Code != 200 || !strings.Contains(scrape.Body.String(), want) {
-				t.Fatalf("failure metrics missing %q in HTTP %d scrape:\n%s", want, scrape.Code, scrape.Body.String())
-			}
-		}
+	t.Run("event persistence and DLQ-gated replay", func(t *testing.T) {
+		testEventDelivery(t, ctx, container, brokers)
+	})
 
-		retryCtx, cancelRetry := context.WithCancel(ctx)
-		t.Cleanup(cancelRetry)
-		retryReceived := make(chan int64, 5)
-		retryCommitted := make(chan int, 5)
-		retryFactory, err := NewClientFactory(retryCtx, cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		retryDone := make(chan error, 1)
-		go func() {
-			retryDone <- consumer.Run(retryCtx, cfg, func(_ context.Context, message consumer.Message) error {
-				retryReceived <- message.Offset
-				return nil
-			}, func(config consumer.Config, topicConfig consumer.TopicConfig) (*observedClient, error) {
-				client, err := retryFactory(config, topicConfig)
-				if err != nil {
-					return nil, err
-				}
-				return &observedClient{Client: client, onCommit: func(messages []consumer.Message) error {
-					retryCommitted <- len(messages)
-					return nil
-				}}, nil
-			})
-		}()
-		remaining := 5 - committedFailures
-		received := make(map[int64]bool)
-		for range remaining {
-			select {
-			case offset := <-retryReceived:
-				if offset < int64(committedFailures) || received[offset] {
-					t.Fatalf("restart replayed committed failure or duplicate offset %d", offset)
-				}
-				received[offset] = true
-			case err := <-retryDone:
-				t.Fatalf("retry stopped before delivering all records: %v", err)
-			case <-time.After(30 * time.Second):
-				t.Fatal("timed out waiting for replayed records")
-			}
-		}
-		waitForCommits(t, retryDone, retryCommitted, remaining, cfg.Kafka.MaxPollRecords)
-		cancelRetry()
-		waitForRun(t, retryDone)
+	t.Run("in-flight DLQ cancellation", func(t *testing.T) {
+		testDeadLetterInFlightCancellation(t, ctx, container, brokers)
 	})
 
 	t.Run("successful offsets survive restart", func(t *testing.T) {
@@ -509,7 +418,10 @@ func startKafka(t *testing.T, ctx context.Context) (*kafkamodule.KafkaContainer,
 	t.Helper()
 	container, err := kafkamodule.Run(ctx, kafkaTestImage,
 		kafkamodule.WithClusterID("go-backend-consumer-tests"),
-		testcontainers.WithEnv(map[string]string{"KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS": "1000"}),
+		testcontainers.WithEnv(map[string]string{
+			"KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS": "1000",
+			"KAFKA_AUTO_CREATE_TOPICS_ENABLE":        "false",
+		}),
 	)
 	if err != nil {
 		t.Fatalf("start Kafka container %s: %v", kafkaTestImage, err)

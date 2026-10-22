@@ -22,6 +22,7 @@ import (
 type Client struct {
 	client       *kgo.Client
 	closeTimeout time.Duration
+	dlqTopic     string
 }
 
 func NewClientFactory(ctx context.Context, cfg consumer.Config) (func(consumer.Config, consumer.TopicConfig) (*Client, error), error) {
@@ -75,6 +76,8 @@ func newClient(cfg consumer.Config, topic consumer.TopicConfig, mechanism sasl.M
 		kgo.SessionTimeout(sessionTimeout),
 		kgo.HeartbeatInterval(heartbeatInterval),
 		kgo.ProducerBatchCompression(compression),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.AllowIdempotentProduceCancellation(),
 	}
 	if tlsConfig != nil {
 		options = append(options, kgo.DialTLSConfig(tlsConfig))
@@ -86,7 +89,7 @@ func newClient(cfg consumer.Config, topic consumer.TopicConfig, mechanism sasl.M
 	if err != nil {
 		return nil, fmt.Errorf("create Kafka client for topic %q: %w", topic.Name, err)
 	}
-	return &Client{client: client, closeTimeout: topic.CommitTimeout}, nil
+	return &Client{client: client, closeTimeout: topic.CommitTimeout, dlqTopic: topic.DeadLetterTopic()}, nil
 }
 
 func (c *Client) Poll(ctx context.Context, maxRecords int) ([]consumer.Message, error) {

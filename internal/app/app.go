@@ -60,6 +60,7 @@ func New(config Config, logger *zap.Logger, extra ...fx.Option) *fx.App {
 		fx.Provide(func() *shutdownState { return &shutdownState{} }),
 		fx.Provide(func(config Config) *sqlite.Store { return sqlite.New(config.SQLiteDSN) }),
 		fx.Provide(func(store *sqlite.Store) greeting.Store { return store }),
+		fx.Provide(func(store *sqlite.Store) message.Store { return store }),
 		fx.Provide(greeting.NewService),
 		fx.Provide(message.NewService),
 		fx.Provide(func(config Config) *metrics.Consumer { return metrics.New(config.Consumer.Topics) }),

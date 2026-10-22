@@ -29,6 +29,7 @@ type Handler func(context.Context, Message) error
 type client interface {
 	Poll(context.Context, int) ([]Message, error)
 	Commit(context.Context, ...Message) error
+	PublishDeadLetter(context.Context, Message, error) error
 	AllowRebalance()
 	CloseAllowingRebalance()
 }
@@ -104,7 +105,7 @@ func runClient(ctx context.Context, cfg Config, topic TopicConfig, handler Handl
 		if err != nil {
 			client.AllowRebalance()
 			if ctx.Err() != nil {
-				return nil	
+				return nil
 			}
 			return fmt.Errorf("poll records: %w", err)
 		}
@@ -127,7 +128,7 @@ func processAndCommitBatch(ctx context.Context, cfg Config, topic TopicConfig, r
 	pollCtx, cancelPoll := context.WithTimeout(ctx, time.Duration(cfg.Kafka.MaxPollIntervalMS)*time.Millisecond)
 	defer cancelPoll()
 	batchCtx, cancelBatch := context.WithTimeout(pollCtx, topic.BatchTimeout)
-	processErr := processBatch(batchCtx, records, handler, semaphore)
+	processErr := processBatch(batchCtx, records, handler, client, semaphore)
 	batchErr := batchCtx.Err()
 	cancelBatch()
 	if batchErr != nil {
@@ -136,20 +137,20 @@ func processAndCommitBatch(ctx context.Context, cfg Config, topic TopicConfig, r
 	if err := pollCtx.Err(); err != nil {
 		return fmt.Errorf("incomplete batch: %w", errors.Join(err, processErr))
 	}
+	if processErr != nil {
+		return fmt.Errorf("process batch: %w", processErr)
+	}
 
 	commitCtx, cancelCommit := context.WithTimeout(pollCtx, topic.CommitTimeout)
 	commitErr := client.Commit(commitCtx, records...)
 	cancelCommit()
 	if commitErr != nil {
-		return errors.Join(fmt.Errorf("commit batch: %w", commitErr), processErr)
-	}
-	if processErr != nil {
-		return fmt.Errorf("process batch (offsets committed): %w", processErr)
+		return fmt.Errorf("commit batch: %w", commitErr)
 	}
 	return nil
 }
 
-func processBatch(ctx context.Context, records []Message, handler Handler, semaphore chan struct{}) error {
+func processBatch(ctx context.Context, records []Message, handler Handler, client client, semaphore chan struct{}) error {
 	var handlers sync.WaitGroup
 	var errorMu sync.Mutex
 	var handlerErrors []error
@@ -165,9 +166,11 @@ func processBatch(ctx context.Context, records []Message, handler Handler, semap
 				return
 			}
 			if err := handler(ctx, record); err != nil {
-				errorMu.Lock()
-				handlerErrors = append(handlerErrors, fmt.Errorf("handle %s partition %d offset %d: %w", record.Topic, record.Partition, record.Offset, err))
-				errorMu.Unlock()
+				if publishErr := client.PublishDeadLetter(ctx, record, err); publishErr != nil {
+					errorMu.Lock()
+					handlerErrors = append(handlerErrors, fmt.Errorf("dead-letter %s partition %d offset %d: %w", record.Topic, record.Partition, record.Offset, errors.Join(err, publishErr)))
+					errorMu.Unlock()
+				}
 			}
 		})
 	}

@@ -58,10 +58,18 @@ type TLSConfig struct {
 
 type TopicConfig struct {
 	Name                  string        `koanf:"name"`
+	DLQTopic              string        `koanf:"dlq_topic"`
 	Consumers             int           `koanf:"consumers"`
 	ProcessingConcurrency int           `koanf:"processing_concurrency"`
 	BatchTimeout          time.Duration `koanf:"batch_timeout"`
 	CommitTimeout         time.Duration `koanf:"commit_timeout"`
+}
+
+func (topic TopicConfig) DeadLetterTopic() string {
+	if topic.DLQTopic != "" {
+		return topic.DLQTopic
+	}
+	return topic.Name + ".dlq"
 }
 
 func DefaultConfig() Config {
@@ -237,7 +245,7 @@ func (cfg Config) Validate() error {
 	}
 	seenTopics := make(map[string]struct{}, len(cfg.Topics))
 	for _, topic := range cfg.Topics {
-		if len(topic.Name) == 0 || len(topic.Name) > 249 || !topicNamePattern.MatchString(topic.Name) || topic.Name == "." || topic.Name == ".." {
+		if !validTopicName(topic.Name) {
 			return fmt.Errorf("topics contains invalid Kafka topic name %q", topic.Name)
 		}
 		if _, exists := seenTopics[topic.Name]; exists {
@@ -258,6 +266,15 @@ func (cfg Config) Validate() error {
 		}
 		if len(cfg.Kafka.GroupID)+1+len(topic.Name) > 249 {
 			return fmt.Errorf("derived consumer group ID for topic %q exceeds 249 characters", topic.Name)
+		}
+	}
+	for _, topic := range cfg.Topics {
+		dlq := topic.DeadLetterTopic()
+		if !validTopicName(dlq) {
+			return fmt.Errorf("topics.%s.dlq_topic is not a valid Kafka topic name: %q", topic.Name, dlq)
+		}
+		if _, consumed := seenTopics[dlq]; consumed {
+			return fmt.Errorf("topics.%s.dlq_topic must not be a consumed topic: %q", topic.Name, dlq)
 		}
 	}
 	if !cfg.Kafka.TLS.Enabled && !cfg.Kafka.AllowInsecure {
@@ -285,6 +302,10 @@ func (cfg Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validTopicName(name string) bool {
+	return len(name) > 0 && len(name) <= 249 && topicNamePattern.MatchString(name) && name != "." && name != ".."
 }
 
 func validateBroker(broker string) error {

@@ -1,6 +1,6 @@
 # Go backend example
 
-A small Echo HTTP service with a greeting feature, a storage port, and a SQLite adapter. Uber Fx composes the adapters and coordinates their lifecycle. Zap provides structured JSON logs. The feature core remains independent of Fx, Echo, Zap, and GORM. The same server can run a configurable franz-go Kafka consumer under Fx. Set `kafka.enabled: true` in `configs/config.yaml` to enable it. Kafka is disabled by default.
+A small Echo HTTP service with a greeting feature, a storage port, and a SQLite adapter. Uber Fx composes the adapters and coordinates their lifecycle. Zap provides structured JSON logs. The greeting core remains independent of Fx, Echo, Zap, and GORM. The same server can run a configurable franz-go Kafka consumer under Fx. It validates event JSON with go-playground/validator and saves events to SQLite. Whole polled batches commit only after every event is saved or its failure is acknowledged by the DLQ. Set `kafka.enabled: true` in `configs/config.yaml` to enable it. Kafka is disabled by default.
 
 Use Go 1.27.3. The module pins Echo v5.4.0, Fx v1.24.0, Zap v1.28.0 and current compatible dependencies in `go.mod` and `go.sum`. These stable versions were checked against the [Go releases](https://go.dev/dl/) and [Go module proxy](https://proxy.golang.org/github.com/labstack/echo/v5/@latest) during implementation.
 
@@ -10,7 +10,7 @@ Use Go 1.27.3. The module pins Echo v5.4.0, Fx v1.24.0, Zap v1.28.0 and current 
 go run ./cmd/server
 ```
 
-The server listens on `:8080` by default and stores greetings in `greetings.db`. Set `HTTP_ADDR` to change the listener, for example `HTTP_ADDR=127.0.0.1:8081`. Set `SQLITE_DSN` to choose another SQLite database path. Fx opens SQLite and creates the `greetings` table before binding HTTP. Shutdown cancels Kafka, drains HTTP, and joins Kafka before closing SQLite and flushing logs. Rows persist across restarts, and deleted IDs are not reused. Logs use Zap's production JSON format on stdout.
+The server listens on `:8080` by default and stores greetings in `greetings.db`. Set `HTTP_ADDR` to change the listener, for example `HTTP_ADDR=127.0.0.1:8081`. Set `SQLITE_DSN` to choose another SQLite database path. Fx opens SQLite and creates the `greetings` and `user_events` tables before binding HTTP. Shutdown cancels Kafka, drains HTTP, and joins Kafka before closing SQLite and flushing logs. Rows persist across restarts, and deleted IDs are not reused. Logs use Zap's production JSON format on stdout.
 
 The SQLite driver uses CGO. Install a C compiler such as GCC before building or running the service.
 
